@@ -13,7 +13,7 @@ import { hostFacts, settingsPath } from "../src/sync.ts";
 
 const PROBE_TIMEOUT_MS = 60_000;
 const settings = JSON.parse(readFileSync(settingsPath(), "utf8"));
-const host = hostFacts(process.env, settings, EXTENSION_ENTRY);
+const host = await hostFacts(process.env, settings, EXTENSION_ENTRY);
 const { agents } = readCatalog(host.agentsDir);
 let failures = 0;
 

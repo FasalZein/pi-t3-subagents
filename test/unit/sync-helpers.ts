@@ -25,11 +25,18 @@ export function tempHost(namespace = "pi-"): TempHost {
 	const extensionPath = join(root, "ext", "index.ts");
 	mkdirSync(agentsDir, { recursive: true });
 	mkdirSync(join(root, "t3"), { recursive: true });
-	for (const skill of ["tdd", "review"]) {
-		mkdirSync(join(configDir, "skills", skill), { recursive: true });
-		writeFileSync(join(configDir, "skills", skill, "SKILL.md"), `---\nname: ${skill}\n---\nbody\n`);
-	}
+	const skill = (dir: string, name: string) => {
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: test skill ${name}\n---\nbody\n`);
+	};
+	for (const name of ["tdd", "review"]) skill(join(configDir, "skills", name), name);
+	// Pi discovery cases the old flat lookup missed: a nested skill folder and a configured skill path.
+	skill(join(configDir, "skills", "group", "nested-skill"), "nested-skill");
+	skill(join(root, "extra-skills", "configured-skill"), "configured-skill");
+	writeFileSync(join(configDir, "settings.json"), JSON.stringify({ skills: [join(root, "extra-skills")] }));
+	// Installed packages in Pi's user install layout.
 	mkdirSync(join(configDir, "npm", "node_modules", "foo"), { recursive: true });
+	mkdirSync(join(configDir, "git", "github.com", "acme", "tools"), { recursive: true });
 	const env: NodeJS.ProcessEnv = {
 		PI_CODING_AGENT_DIR: configDir,
 		PI_T3_SETTINGS_PATH: settingsPath,

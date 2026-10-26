@@ -56,6 +56,106 @@ export const RESERVED_FLAGS = new Set([
 	"--version",
 ]);
 
+/**
+ * Pi flags whose value is a credential (`pi --help`, Pi 1.4.0). T3 stores
+ * launchArgs in plain settings and does not redact them, so an agent that
+ * passes one in `flags` is skipped; the value belongs in the agent `env`,
+ * which the child reads at runtime (ADR 0002).
+ */
+export const CREDENTIAL_FLAGS = new Set(["--api-key"]);
+
+/**
+ * T3's Pi launch argument contract (C7), copied from T3 resolvePiLaunchArgs
+ * (provider-pi mcpInjection.ts, nightly 0.1.3-nightly.20261026.3710).
+ */
+const T3_FLAGS_WITH_VALUES = new Set([
+	"--api-key",
+	"--append-system-prompt",
+	"--exclude-tools",
+	"-xt",
+	"--extension",
+	"-e",
+	"--model",
+	"--models",
+	"--name",
+	"-n",
+	"--prompt-template",
+	"--provider",
+	"--session-dir",
+	"--skill",
+	"--system-prompt",
+	"--theme",
+	"--thinking",
+	"--tools",
+	"-t",
+	"--tui-mode",
+	"--use-theme",
+]);
+const T3_FLAGS_WITHOUT_VALUES = new Set([
+	"--approve",
+	"-a",
+	"--no-approve",
+	"-na",
+	"--no-builtin-tools",
+	"-nbt",
+	"--no-context-files",
+	"-nc",
+	"--no-extensions",
+	"-ne",
+	"--no-prompt-templates",
+	"-np",
+	"--no-skills",
+	"-ns",
+	"--no-themes",
+	"--no-tools",
+	"-nt",
+	"--offline",
+	"--verbose",
+]);
+
+/**
+ * Problems that make T3 reject these launch arguments (the instance becomes
+ * unavailable). Messages name flags only, never values.
+ */
+export function t3LaunchArgProblems(tokens: readonly string[]): string[] {
+	const args = tokens.flatMap((arg) => {
+		const eq = arg.indexOf("=");
+		return eq > 0 && T3_FLAGS_WITH_VALUES.has(arg.slice(0, eq)) ? [arg.slice(0, eq), arg.slice(eq + 1)] : [arg];
+	});
+	const problems: string[] = [];
+	let hasProvider = false;
+	let hasModel = false;
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		const flag = arg.split("=")[0];
+		if (RESERVED_FLAGS.has(flag) || ["-c", "-h", "-p", "-r", "-v"].includes(arg)) {
+			problems.push(`"${flag}" is reserved by T3`);
+			continue;
+		}
+		if (arg === "--") {
+			problems.push('"--" is not supported by T3');
+			continue;
+		}
+		if (T3_FLAGS_WITH_VALUES.has(arg)) {
+			if (args[i + 1] === undefined) problems.push(`"${arg}" needs a value`);
+			if (arg === "--provider") hasProvider = true;
+			if (arg === "--model") hasModel = true;
+			i++;
+			continue;
+		}
+		if (T3_FLAGS_WITHOUT_VALUES.has(arg) || (arg.startsWith("--") && arg.includes("="))) continue;
+		if (arg.startsWith("--")) {
+			const next = args[i + 1];
+			if (next !== undefined && !next.startsWith("-") && !next.startsWith("@")) i++;
+			continue;
+		}
+		if (arg.startsWith("-")) problems.push(`short flag "${arg}" is not supported by T3; use the long form`);
+		else problems.push("a positional argument is not supported by T3");
+	}
+	if (hasProvider && !hasModel) problems.push('"--provider" needs "--model"');
+	return problems;
+}
+
 /** Bridge tools that start threads or tasks. Leaves exclude them (D22). */
 export const THREAD_STARTING_TOOLS = [
 	"delegate_task",
@@ -260,12 +360,16 @@ function planOrThrow(agent: AgentDefinition, host: HostFacts, id: string): Insta
 		}
 		for (const token of tokens) {
 			const flag = token.split("=")[0];
-			if (RESERVED_FLAGS.has(flag)) throw new SkipAgent(`flags: "${flag}" is reserved by T3`);
-			if (/^-[^-]/.test(token)) throw new SkipAgent(`flags: short flag "${token}" is not supported by T3; use the long form`);
-			if (token === "--") throw new SkipAgent('flags: "--" is not supported by T3');
+			if (CREDENTIAL_FLAGS.has(flag))
+				throw new SkipAgent(`flags: "${flag}" carries a credential, and T3 stores launch arguments in plain settings; set the key in the agent env instead`);
 		}
+		const problems = t3LaunchArgProblems(tokens);
+		if (problems.length > 0) throw new SkipAgent(`flags: ${problems[0]}`);
 		args.push(...tokens);
 	}
+	// The whole argument list must pass T3's contract (for example --provider without --model).
+	const problems = t3LaunchArgProblems(args);
+	if (problems.length > 0) throw new SkipAgent(`launch arguments: ${problems.join("; ")}`);
 
 	for (const [field, note] of Object.entries(GAP_FIELDS)) if (f[field] !== undefined) gaps.push(note);
 	if (f["session-mode"] === "fork") gaps.push("session-mode: fork is not supported; the child starts fresh (A9)");

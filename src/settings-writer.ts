@@ -7,6 +7,7 @@
  * compare and the rename can be lost, and a T3 save after the rename can
  * erase this write. The second case is detected by `verify`.
  */
+import { randomUUID } from "node:crypto";
 import { chmodSync, closeSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
@@ -27,8 +28,9 @@ export interface WriterHooks {
 }
 
 export interface WriteRequest {
+	/** The lock is derived from this path, so every writer of one settings file shares it. */
 	readonly settingsPath: string;
-	/** Folder for the lock and `backups/` (`<config dir>/t3-subagents`). */
+	/** Folder for `backups/` (`<config dir>/t3-subagents`). */
 	readonly stateDir: string;
 	/** The exact file text the change was planned from (step 1). */
 	readonly originalText: string;
@@ -44,27 +46,51 @@ export interface WriteRequest {
 export type WriteOutcome =
 	| { readonly status: "written"; readonly backupPath: string }
 	| { readonly status: "changed"; readonly message: string }
+	| { readonly status: "lock-lost"; readonly message: string }
 	| { readonly status: "lost"; readonly backupPath: string; readonly message: string; readonly problems: readonly string[] };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-export function lockPath(stateDir: string): string {
-	return join(stateDir, "settings-writer.lock");
+/**
+ * One lock per settings file, next to it. Deriving it from the settings path
+ * (not from PI_CODING_AGENT_DIR) makes two Pi profiles that target the same
+ * T3 settings file serialize on the same lock.
+ */
+export function lockPath(settingsPath: string): string {
+	return join(dirname(settingsPath), `.${basename(settingsPath)}.pi-t3-subagents.lock`);
 }
 
-export async function acquireLock(stateDir: string, waitMs = DEFAULT_LOCK_WAIT_MS): Promise<() => void> {
-	mkdirSync(stateDir, { recursive: true, mode: PRIVATE_DIR_MODE });
-	const path = lockPath(stateDir);
+export interface WriterLock {
+	/** True while the lock file still holds this acquisition's token. */
+	owns(): boolean;
+	/** Removes the lock file only when this acquisition still owns it. */
+	release(): void;
+}
+
+export async function acquireLock(settingsPath: string, waitMs = DEFAULT_LOCK_WAIT_MS): Promise<WriterLock> {
+	const path = lockPath(settingsPath);
+	const token = `${process.pid} ${randomUUID()}`;
+	const owns = () => {
+		try {
+			return readFileSync(path, "utf8") === token;
+		} catch {
+			return false;
+		}
+	};
 	const deadline = Date.now() + waitMs;
 	for (;;) {
 		try {
 			const fd = openSync(path, "wx", PRIVATE_FILE_MODE);
-			writeFileSync(fd, `${process.pid} ${new Date().toISOString()}\n`);
+			writeFileSync(fd, token);
 			closeSync(fd);
-			return () => {
-				try {
-					unlinkSync(path);
-				} catch {}
+			return {
+				owns,
+				release() {
+					if (!owns()) return; // Taken over after it went stale: never delete another writer's lock.
+					try {
+						unlinkSync(path);
+					} catch {}
+				},
 			};
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -117,9 +143,10 @@ function exists(path: string): boolean {
 const readText = (path: string) => readFileSync(path, "utf8");
 const CHANGED = "settings changed, run the sync again";
 const LOST = "lost to a concurrent T3 settings save; run the sync again";
+const LOCK_LOST = "the settings writer lock was taken over by another writer; run the sync again";
 
 export async function writeSettings(req: WriteRequest): Promise<WriteOutcome> {
-	const release = await acquireLock(req.stateDir, req.lockWaitMs);
+	const lock = await acquireLock(req.settingsPath, req.lockWaitMs);
 	let tmp: string | undefined;
 	let backupPath: string;
 	try {
@@ -128,6 +155,8 @@ export async function writeSettings(req: WriteRequest): Promise<WriteOutcome> {
 		tmp = join(dirname(req.settingsPath), `.${basename(req.settingsPath)}.t3-subagents-${process.pid}-${Date.now()}.tmp`);
 		writeFileSync(tmp, req.nextText, { mode: PRIVATE_FILE_MODE, flag: "wx" });
 		await req.hooks?.beforeFinalCompare?.();
+		// A writer that lost its lock (stale takeover) must not commit: another writer may be mid-write.
+		if (!lock.owns()) return { status: "lock-lost", message: LOCK_LOST };
 		if (readText(req.settingsPath) !== req.originalText) return { status: "changed", message: CHANGED };
 		renameSync(tmp, req.settingsPath);
 		tmp = undefined;
@@ -138,7 +167,7 @@ export async function writeSettings(req: WriteRequest): Promise<WriteOutcome> {
 				unlinkSync(tmp);
 			} catch {}
 		}
-		release();
+		lock.release();
 	}
 	await sleep(req.reloadWaitMs ?? DEFAULT_RELOAD_WAIT_MS);
 	let problems: string[];

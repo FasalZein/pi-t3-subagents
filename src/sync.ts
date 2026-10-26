@@ -4,7 +4,8 @@
  * writer. Spec "Sync flow and settings writer".
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
+import { DefaultPackageManager, DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { type AgentDefinition, agentConfigDir, agentsDir, readCatalog } from "./catalog.ts";
@@ -72,11 +73,12 @@ export function planSync(input: {
 		else actions.push({ kind: "update", id: plan.id, agent: plan.agent, entry: plan.entry });
 	}
 
-	// Owned entries of this namespace without an enabled agent: disable (D12), prune when asked.
+	// Owned entries of this namespace without an enabled agent: disable first (D12).
+	// --prune deletes only entries already stored as disabled, so old threads stay readable until then.
 	for (const [id, entry] of Object.entries(instances)) {
 		if (id === mainId || planned.has(id) || keep.has(id) || !id.startsWith(ns) || !isOwnedBy(entry, ns)) continue;
-		if (input.prune) actions.push({ kind: "prune", id });
-		else if (entry.enabled !== false) actions.push({ kind: "disable", id, entry: { ...entry, enabled: false } });
+		if (entry.enabled !== false) actions.push({ kind: "disable", id, entry: { ...entry, enabled: false } });
+		else if (input.prune) actions.push({ kind: "prune", id });
 	}
 
 	const warnings: string[] = [];
@@ -141,11 +143,12 @@ export function formatPlan(plan: SyncPlan): string {
 }
 
 /** Production host facts from the environment and the main instance (A12-A14). */
-export function hostFacts(env: NodeJS.ProcessEnv, settings: Settings, extensionPath: string): HostFacts {
+export async function hostFacts(env: NodeJS.ProcessEnv, settings: Settings, extensionPath: string): Promise<HostFacts> {
 	const namespace = namespaceOf(env);
 	const configDir = agentConfigDir(env);
 	const home = homedir();
 	const mainBinary = settings.providerInstances?.[mainInstanceId(namespace)]?.config?.binaryPath;
+	const resources = await piResources(configDir, configDir);
 	return {
 		namespace,
 		extensionPath,
@@ -153,10 +156,29 @@ export function hostFacts(env: NodeJS.ProcessEnv, settings: Settings, extensionP
 		agentsDir: agentsDir(env),
 		binaryPath: typeof mainBinary === "string" && mainBinary ? mainBinary : whichPi(),
 		home,
-		resolveSkill: (name) =>
-			[join(configDir, "skills", name, "SKILL.md"), join(home, ".agents", "skills", name, "SKILL.md")].find((p) => existsSync(p)),
-		resolvePackage: (spec) => installedPackagePath(spec, configDir),
+		resolveSkill: (name) => resources.skills.get(name),
+		resolvePackage: resources.resolvePackage,
 	};
+}
+
+/**
+ * Pi's own resource view of the global configuration, as pi-subagents uses it:
+ * the discovered skills (default folders, nested skill folders, configured
+ * skill paths and package skills) by name, and the installed path of an
+ * `npm:` or `git:` spec (versions and refs included). Global scope only:
+ * the instance serves every project, so project resources do not count.
+ */
+export async function piResources(
+	configDir: string,
+	cwd: string,
+): Promise<{ skills: Map<string, string>; resolvePackage: (spec: string) => string | undefined }> {
+	const settingsManager = SettingsManager.create(cwd, configDir);
+	const loader = new DefaultResourceLoader({ cwd, agentDir: configDir, settingsManager, noExtensions: true });
+	await loader.reload();
+	const skills = new Map<string, string>();
+	for (const skill of loader.getSkills().skills) if (skill.sourceInfo?.scope !== "project") skills.set(skill.name, skill.filePath);
+	const packages = new DefaultPackageManager({ cwd, agentDir: configDir, settingsManager });
+	return { skills, resolvePackage: (spec) => packages.getInstalledPath(spec, "user") };
 }
 
 function whichPi(): string {
@@ -165,25 +187,6 @@ function whichPi(): string {
 	} catch {
 		return "pi";
 	}
-}
-
-/**
- * Installed path of an `npm:` or `git:` package spec, matching Pi's install
- * layout (`<config dir>/npm/node_modules/<name>`, `<config dir>/git/<host>/<path>`).
- * Versioned npm specs and missing installs pass through for Pi to resolve.
- */
-export function installedPackagePath(spec: string, configDir: string): string | undefined {
-	if (spec.startsWith("npm:")) {
-		const name = spec.slice(4);
-		if (/@[^/]*$/.test(name.replace(/^@/, ""))) return undefined; // Versioned.
-		const path = join(configDir, "npm", "node_modules", name);
-		return existsSync(path) ? path : undefined;
-	}
-	if (spec.startsWith("git:")) {
-		const path = join(configDir, "git", spec.slice(4).replace(/\.git$/, ""));
-		return !spec.includes("@") && existsSync(path) ? path : undefined;
-	}
-	return undefined;
 }
 
 export interface SyncUi {
@@ -203,7 +206,7 @@ export interface SyncRunOptions {
 }
 
 export interface SyncReport {
-	readonly status: "up-to-date" | "written" | "declined" | "needs-yes" | "refused" | "changed" | "lost";
+	readonly status: "up-to-date" | "written" | "declined" | "needs-yes" | "refused" | "changed" | "lock-lost" | "lost";
 	readonly text: string;
 	readonly plan?: SyncPlan;
 	readonly outcome?: WriteOutcome;
@@ -233,7 +236,7 @@ export async function runSync(opts: SyncRunOptions): Promise<SyncReport> {
 	const shape = settingsShapeProblems(settings);
 	if (shape.length > 0) return { status: "refused", text: `T3 settings have an unexpected shape (C6); no write:\n  ${shape.join("\n  ")}` };
 
-	const host = opts.host ? opts.host(settings) : hostFacts(opts.env, settings, opts.extensionPath);
+	const host = opts.host ? opts.host(settings) : await hostFacts(opts.env, settings, opts.extensionPath);
 	const catalog = readCatalog(host.agentsDir);
 	const plan = planSync({ agents: catalog.agents, settings, host, prune });
 	const unreadable = catalog.unreadable.map((u) => `  unreadable agent file ${u.path}: ${u.reason}`);
@@ -258,7 +261,7 @@ export async function runSync(opts: SyncRunOptions): Promise<SyncReport> {
 	const counts = ["add", "update", "disable", "prune"]
 		.map((k) => `${k} ${plan.actions.filter((a) => a.kind === k).length}`)
 		.join(", ");
-	if (outcome.status === "changed") return { status: "changed", text: `${text}\n${outcome.message}`, plan, outcome };
+	if (outcome.status === "changed" || outcome.status === "lock-lost") return { status: outcome.status, text: `${text}\n${outcome.message}`, plan, outcome };
 	if (outcome.status === "lost")
 		return { status: "lost", text: `${text}\n${outcome.message} (${outcome.problems.join("; ")}). Backup: ${outcome.backupPath}`, plan, outcome };
 	return { status: "written", text: `${text}\nWritten: ${counts}. Backup: ${outcome.backupPath}`, plan, outcome };

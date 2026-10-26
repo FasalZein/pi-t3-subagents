@@ -90,22 +90,28 @@ function envKeysOf(lines: string[]): string[] {
 	return keys;
 }
 
-/** Reads every `*.md` agent file in the folder, disabled ones included. */
+/**
+ * Effective global agents, as pi-subagents getEffectiveAgentDefinitions: files
+ * in localeCompare order, disabled files skipped, and for one name the last
+ * enabled file wins. Only enabled agents are returned.
+ */
 export function readCatalog(dir: string): CatalogResult {
 	if (!existsSync(dir)) return { agents: [], unreadable: [] };
-	const agents: AgentDefinition[] = [];
+	const byName = new Map<string, AgentDefinition>();
 	const unreadable: { path: string; reason: string }[] = [];
-	for (const file of readdirSync(dir).filter((f) => f.endsWith(".md")).sort()) {
+	for (const file of readdirSync(dir)
+		.filter((f) => f.endsWith(".md"))
+		.sort((a, b) => a.localeCompare(b))) {
 		const path = join(dir, file);
 		try {
 			const agent = parseAgentFile(path);
-			if (agent) agents.push(agent);
-			else unreadable.push({ path, reason: "no frontmatter block" });
+			if (!agent) unreadable.push({ path, reason: "no frontmatter block" });
+			else if (agent.enabled) byName.set(agent.name, agent);
 		} catch (error) {
 			unreadable.push({ path, reason: (error as Error).message });
 		}
 	}
-	return { agents, unreadable };
+	return { agents: [...byName.values()].sort((a, b) => a.name.localeCompare(b.name)), unreadable };
 }
 
 /** D18: project agents live in `<cwd>/.pi/agents`; v1 does not support them. */

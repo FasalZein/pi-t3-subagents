@@ -5,7 +5,7 @@
  * The environment (settings path, namespace) is bound when the checks are built.
  */
 import { readFileSync } from "node:fs";
-import { mainInstanceId, RESERVED_FLAGS, tokenizeArgs } from "./planner.ts";
+import { mainInstanceId, t3LaunchArgProblems, tokenizeArgs } from "./planner.ts";
 import { isOwnedBy, type Settings, settingsShapeProblems } from "./settings-shape.ts";
 import type { CheckResult, CompatibilityCheck } from "./doctor.ts";
 import { namespaceOf, settingsPath } from "./sync.ts";
@@ -35,7 +35,7 @@ export const c6SettingsShape = (env: Env): CompatibilityCheck => ({
 
 export const c7LaunchArgs = (env: Env): CompatibilityCheck => ({
 	id: "C7",
-	contract: "Managed instance launch arguments (tokenizer, reserved flags, enabled state)",
+	contract: "Managed instance launch arguments pass T3's launch argument rules",
 	run() {
 		let settings: Settings;
 		try {
@@ -49,19 +49,23 @@ export const c7LaunchArgs = (env: Env): CompatibilityCheck => ({
 		for (const [id, entry] of Object.entries(settings.providerInstances ?? {})) {
 			if (!isOwnedBy(entry, ns) || id === mainInstanceId(ns)) continue;
 			const launchArgs = entry.config?.launchArgs;
-			let tokens: string[] = [];
+			if (typeof launchArgs !== "string") {
+				problems.push(`${id}: config.launchArgs is missing or not a string`);
+				continue;
+			}
+			let tokens: string[];
 			try {
-				tokens = typeof launchArgs === "string" ? tokenizeArgs(launchArgs) : [];
+				tokens = tokenizeArgs(launchArgs);
 			} catch (error) {
 				problems.push(`${id}: launchArgs do not tokenize (${(error as Error).message})`);
+				continue;
 			}
-			for (const t of tokens) {
-				if (RESERVED_FLAGS.has(t.split("=")[0])) problems.push(`${id}: reserved flag ${t}`);
-				if (/^-[^-]/.test(t)) problems.push(`${id}: short flag ${t}`);
-			}
-			lines.push(`${id}: ${entry.enabled === false ? "disabled" : "enabled"}`);
+			for (const problem of t3LaunchArgProblems(tokens)) problems.push(`${id}: ${problem}`);
+			lines.push(`${id}: stored ${entry.enabled === false ? "disabled" : "enabled"}`);
 		}
-		return problems.length ? fail(problems.join("; ")) : pass(lines.length ? lines.join(", ") : `no managed instances in namespace ${ns}`);
+		return problems.length
+			? fail(`${problems.join("; ")}. T3 marks such an instance unavailable.`)
+			: pass(lines.length ? `${lines.join(", ")}. Runtime availability in T3 is not checked here.` : `no managed instances in namespace ${ns}`);
 	},
 });
 

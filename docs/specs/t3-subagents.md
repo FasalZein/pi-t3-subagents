@@ -312,7 +312,7 @@ Known drift: a wake that never arrives (for example after a Pi process restart, 
 2. Plan per agent: add, update, unchanged, disable, prune (only with `--prune`), conflict (id exists without matching markers), skip (with reason). Collect gap notes. Warn when the main instance lacks the extension argument.
 3. Show the plan. No environment values appear in it. No changes: report "up to date"; no write, no backup.
 4. Confirm through the UI; without a UI require `--yes`.
-5. Take the own-writer lock (a lock file in `~/.pi/agent/t3-subagents/`, created exclusively, stale after 60 seconds). It serializes this extension's writers (sync, live-test setup and teardown); it does not lock T3.
+5. Take the own-writer lock (a lock file next to the settings file, `.settings.json.pi-t3-subagents.lock`, created exclusively, stale after 60 seconds; revised after the S2 review so that every Pi profile that targets one settings file shares one lock). Each acquisition writes its own token: a release removes only its own lock, and a writer whose lock was taken over does not commit. It serializes this extension's writers (sync, live-test setup and teardown); it does not lock T3.
 6. Save the backup (folder mode 0700, file mode 0600); keep the newest 10.
 7. Write the new content to a temporary file in the settings folder (mode 0600). Change only the planned `providerInstances` entries; keep all other content.
 8. Read the settings file again and compare it with the content from step 1. If it changed, delete the temporary file, release the lock, and stop: "settings changed, run the sync again". Otherwise rename the temporary file over `settings.json` at once.
