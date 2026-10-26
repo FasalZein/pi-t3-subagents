@@ -45,9 +45,25 @@ export function restoredState(data: unknown, agent: string, instanceId: string):
 	return { agent, instanceId, budget: d.budget, caller: d.caller, expectedRevision: d.expectedRevision, source: d.source, stale: d.stale };
 }
 
-/** The leading frontmatter block of an agent file, without its line end. */
-function frontmatterBlock(text: string): string | undefined {
-	return text.match(/^---\r?\n[\s\S]*?\r?\n---[ \t]*/)?.[0];
+const BLOCK = /(^|\n)[ \t]*---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?=\r?\n|$)/g;
+/** Keys that mark a block as agent-definition frontmatter (pi-subagents field names). */
+const AGENT_KEYS = /^(name|description|env|model|thinking|tools|system-prompt|extensions|skills|spawning)[ \t]*:/m;
+
+/**
+ * Remove the agent file's frontmatter from the prompt section that Pi built from it.
+ * The section is Pi's snapshot from load time, so it may differ from the current file:
+ * a block is removed when it leads the section or names this agent. `proven` is false
+ * when a block with agent-definition keys remains (the caller then stops the run).
+ */
+export function stripAgentFrontmatter(section: string, agentName: string): { text: string; proven: boolean } {
+	const lead = section.length - section.trimStart().length;
+	const named = new RegExp(`^name[ \\t]*:[ \\t]*${agentName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[ \\t]*$`, "m");
+	let text = section.replace(BLOCK, (block, sep: string, body: string, offset: number) =>
+		offset <= lead || named.test(body) ? sep : block,
+	);
+	text = text.replace(/^\s+/, "");
+	const leftover = [...text.matchAll(BLOCK)].some((m) => AGENT_KEYS.test(m[2]));
+	return { text, proven: !leftover };
 }
 
 export type HeaderSource = "header" | "missing" | "unreadable";
@@ -168,27 +184,30 @@ export function installChildRuntime(pi: ExtensionAPI, env: Env): ChildRuntime | 
 		promptSections = !!options && typeof options === "object";
 		// Fail closed: without the agent definition or the prompt sections, the agent file's
 		// frontmatter (env values included) could reach the model. Stop before any request.
-		if (!promptSections || !agent) {
-			const why = !agent
-				? `agent '${agentName}' is not an enabled global agent in ${agentsDir(env as NodeJS.ProcessEnv)}`
-				: "Pi gave no systemPromptOptions (C8)";
+		const stop = (why: string) => {
 			(ctx as any)?.ui?.notify?.(`pi-t3-subagents: run stopped before any model request: ${why}. Run /t3-sync-agents and launch again.`, "error");
 			(ctx as any)?.abort?.();
 			return { systemPrompt: "" };
-		}
-		// D14: strip the frontmatter only in the section that holds the agent file.
-		const mode = agent.fields["system-prompt"];
-		const key = mode === "replace" ? "customPrompt" : mode === "append" && agent.fields["inherit-append-system"] !== "true" ? "appendSystemPrompt" : undefined;
-		const block = key ? frontmatterBlock(readFileSync(agent.path, "utf8")) : undefined;
-		const value = key ? options[key] : undefined;
-		if (key && block && typeof value === "string") {
-			const at = value.indexOf(block);
-			if (at >= 0) options[key] = value.slice(0, at) + value.slice(at + block.length).replace(/^\s+/, "");
-		}
-		if (agent.fields["system-prompt"] === "append" && agent.fields["inherit-append-system"] === "true") {
-			const body = stripFrontmatter(readFileSync(agent.path, "utf8")).trim();
-			const current = typeof options.appendSystemPrompt === "string" ? options.appendSystemPrompt : "";
-			if (!current.includes(body)) options.appendSystemPrompt = current ? `${current}\n\n${body}` : body;
+		};
+		if (!agent) return stop(`agent '${agentName}' is not an enabled global agent in ${agentsDir(env as NodeJS.ProcessEnv)}`);
+		if (!promptSections) return stop("Pi gave no systemPromptOptions (C8)");
+		try {
+			// D14: strip the frontmatter only in the section that holds the agent file.
+			const mode = agent.fields["system-prompt"];
+			const key = mode === "replace" ? "customPrompt" : mode === "append" && agent.fields["inherit-append-system"] !== "true" ? "appendSystemPrompt" : undefined;
+			const value = key ? options[key] : undefined;
+			if (key && typeof value === "string") {
+				const stripped = stripAgentFrontmatter(value, agentName);
+				if (!stripped.proven) return stop(`the ${key} section still holds agent frontmatter after the strip`);
+				options[key] = stripped.text;
+			}
+			if (mode === "append" && agent.fields["inherit-append-system"] === "true") {
+				const body = stripFrontmatter(readFileSync(agent.path, "utf8")).trim();
+				const current = typeof options.appendSystemPrompt === "string" ? options.appendSystemPrompt : "";
+				if (!current.includes(body)) options.appendSystemPrompt = current ? `${current}\n\n${body}` : body;
+			}
+		} catch (error) {
+			return stop(`the prompt could not be prepared safely (${(error as Error).message})`);
 		}
 	});
 

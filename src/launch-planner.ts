@@ -63,6 +63,8 @@ export interface LaunchContext {
 	readonly supportsThinking: (slug: string) => boolean;
 	/** Pi's registry: a bare model id (optionally with a --provider hint) to `provider/id`, or undefined. */
 	readonly resolveModel?: (id: string, provider?: string) => string | undefined;
+	/** Thinking levels a `provider/id` model offers (Pi registry), or undefined when unknown. */
+	readonly thinkingLevels?: (slug: string) => readonly string[] | undefined;
 	readonly host: HostFacts;
 	readonly settings: Settings;
 	/** The bridge tool is registered and callable in this session (C3). */
@@ -183,7 +185,7 @@ function modelAllowed(effective: string, allowed: string): boolean {
 export function resolveTarget(
 	agent: AgentDefinition,
 	params: LaunchParams,
-	ctx: Pick<LaunchContext, "parentModel" | "parentThinking" | "supportsThinking" | "resolveModel">,
+	ctx: Pick<LaunchContext, "parentModel" | "parentThinking" | "supportsThinking" | "resolveModel" | "thinkingLevels">,
 	instanceId: string,
 ): { target: Target; modelLabel: string; overrideModel?: string; overrideThinking?: string } {
 	// A configured bare id (for example `model: claude-haiku-5-5` with `flags: --provider x`)
@@ -199,7 +201,19 @@ export function resolveTarget(
 	const parent = ctx.parentModel ? splitModelRef(ctx.parentModel) : undefined;
 
 	const effectiveModel = override?.model ?? agentModel?.model ?? parent?.model;
-	const effectiveThinking = overrideThinking ?? agentThinking ?? parent?.thinking ?? ctx.parentThinking;
+	let effectiveThinking: string | undefined = overrideThinking ?? agentThinking ?? parent?.thinking ?? ctx.parentThinking;
+
+	// pi-subagents resolveAvailableModelRef (cf6dbf4): with a model override, a thinking
+	// level the target model does not offer is dropped when it is inherited (agent or
+	// parent value) and refused when the caller asked for it (`thinking` or a model suffix).
+	if (override && effectiveThinking) {
+		const supported = ctx.thinkingLevels?.(override.model);
+		if (supported && !supported.includes(effectiveThinking)) {
+			if (overrideThinking)
+				throw new LaunchError(`Model '${override.model}' does not support thinking level '${effectiveThinking}'. Supported levels: ${supported.join(", ")}.`);
+			effectiveThinking = undefined;
+		}
+	}
 
 	const allowed = list(agent.fields["allowed-models"]);
 	if (allowed.length > 0) {

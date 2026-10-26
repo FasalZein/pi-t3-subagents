@@ -7,6 +7,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { FakeBridge } from "../harness/fake-bridge.ts";
 import { join } from "node:path";
 import { launchKey } from "../../src/launch-planner.ts";
+import { sessionLaunchStore } from "../../src/subagent-tool.ts";
 import type { LaunchOutcome } from "../../src/subagent-tool.ts";
 import { DELEGATE, type LaunchFixture, launchFixture, RUNNING, writeProjectAgent } from "./launch-helpers.ts";
 
@@ -119,6 +120,26 @@ test("A1: allow-model-override false drops the override", async () => {
 test("A1: an agent without a model inherits the parent's model and thinking", async () => {
 	expect(await target("fx-nomodel")).toEqual({ providerInstanceId: "t3t-fx-nomodel", model: "cpa/claude-opus-5-5", options: { thinking: "medium" } });
 });
+test("thinking with a model override: an unsupported inherited level is dropped (pi-subagents parity)", async () => {
+	// fx-shell has thinking: low; zai/glm-flash offers off, high, xhigh.
+	expect(await target("fx-shell", { model: "zai/glm-flash" })).toEqual({ providerInstanceId: "t3t-fx-shell", model: "zai/glm-flash", options: {} });
+});
+
+test("thinking with a model override: an unsupported explicit level is refused before the bridge; a supported one is sent", async () => {
+	for (const extra of [{ model: "zai/glm-flash", thinking: "low" }, { model: "zai/glm-flash:low" }]) {
+		const bridge = f.bridge();
+		await expect(f.run(f.tool(), bridge, { ...base, agent: "fx-shell", ...extra })).rejects.toThrow(
+			"Model 'zai/glm-flash' does not support thinking level 'low'. Supported levels: off, high, xhigh.",
+		);
+		expect(bridge.calls).toEqual([]);
+	}
+	expect(await target("fx-shell", { model: "zai/glm-flash", thinking: "high" })).toEqual({
+		providerInstanceId: "t3t-fx-shell",
+		model: "zai/glm-flash",
+		options: { thinking: "high" },
+	});
+});
+
 test("A1: thinking is not sent for a model without thinking support", async () => {
 	f.h.agent("fx-leaf", "name: fx-leaf\ndescription: Leaf\nmodel: cpa/claude-haiku-5-5\nthinking: low\nsystem-prompt: replace");
 	f.sync();
@@ -194,11 +215,36 @@ test("launch keys: a changed shell-expansion output alone keeps the key", async 
 	const params = { ...base, agent: "fx-shell", task: "Value: !`cat value.txt`" };
 	await f.run(f.tool(), bridge, params);
 	writeFileSync(file, "second");
-	await f.run(f.tool(), bridge, params);
+	// A different call id with the same request is a new launch: it expands again and gets a new key.
+	await f.run(f.tool(), bridge, params, "call-2");
 	const [a, b] = bridge.calls.map((c) => c.args);
 	expect(a.task).toContain("Value: first");
 	expect(b.task).toContain("Value: second");
-	expect(a.clientRequestId).toBe(b.clientRequestId);
+	expect(launchKey("call-1", 0, params)).toBe(a.clientRequestId);
+	// The key covers the request before expansion: the expanded output is not part of it.
+	expect(a.clientRequestId).toBe(launchKey("call-1", 0, { ...params }));
+});
+
+test("D23: an exact retry after a reload (new tool instance) resends the saved launch; shell expansion does not run again", async () => {
+	const counter = join(f.cwd, "count.txt");
+	const bridge = f.bridge();
+	const params = { ...base, agent: "fx-shell", task: "Run: !`echo x >> count.txt; wc -l < count.txt`" };
+	await f.run(f.tool(), bridge, params, "call-reload");
+	await f.run(f.tool(), bridge, params, "call-reload"); // A reload rebuilds the tool: the memory cache is gone.
+	expect(readFileSync(counter, "utf8")).toBe("x\n");
+	const [a, b] = bridge.calls.map((c) => c.args);
+	expect(b).toEqual(a);
+});
+
+test("D23: the production launch store reads saved launches from the session entries", () => {
+	const appended: Array<[string, unknown]> = [];
+	const store = sessionLaunchStore({ appendEntry: (type: string, data: unknown) => appended.push([type, data]) } as any);
+	const record = { key: "k1", name: "n", agent: "fx-shell", instanceId: "i", revision: "r", childBudget: 0, modelLabel: "default", args: { task: "T", clientRequestId: "k1" } } as any;
+	store.save(record);
+	expect(appended).toEqual([["pi-t3-subagents-launch", record]]);
+	const ctx = { sessionManager: { getEntries: () => [{ type: "custom", customType: "pi-t3-subagents-launch", data: record }] } };
+	expect(store.load("k1", ctx)).toEqual(record);
+	expect(store.load("k2", ctx)).toBeUndefined();
 });
 
 // --- Result states.

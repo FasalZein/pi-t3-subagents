@@ -1,6 +1,6 @@
 /** Layer 1 child: header, budget, revision check, env at load, prompt strip, roster. */
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { readCatalog } from "../../src/catalog.ts";
 import { createExtension } from "../../index.ts";
@@ -131,6 +131,36 @@ test("fail closed: an agent disabled between validation and load stops the run b
 	expect(calls.abort).toBe(1);
 	expect(results).toContainEqual({ systemPrompt: "" });
 	expect(host.notifications.at(-1)?.message).toContain("stopped before any model request");
+});
+
+test("a prompt snapshot from an older agent file (frontmatter edited since load) is still stripped", async () => {
+	const { host } = await child("fx-env");
+	// Pi's snapshot from load time; the file changed afterwards (env edited without a sync).
+	const snapshot = "---\nname: fx-env\ndescription: Env\nenv: |\n  FX_OLD_SECRET=synthetic-old-value\nsystem-prompt: replace\n---\n\n# fx-env body\n";
+	const systemPromptOptions: any = { cwd: "/tmp", customPrompt: snapshot, sections: {} };
+	const { calls } = await runStart(host, systemPromptOptions);
+	expect(calls.abort).toBe(0);
+	expect(systemPromptOptions.customPrompt).toBe("# fx-env body\n");
+	expect(systemPromptOptions.customPrompt).not.toContain("synthetic-old-value");
+});
+
+test("fail closed: agent frontmatter that cannot be identified for removal stops the run", async () => {
+	const { host } = await child("fx-env");
+	// The section holds another agent-shaped block after the agent body: removal is not proven.
+	const snapshot = "# preface\n\n---\nname: other\nenv: |\n  FX_OLD_SECRET=synthetic-old-value\n---\nbody";
+	const systemPromptOptions: any = { cwd: "/tmp", customPrompt: snapshot, sections: {} };
+	const { calls, results } = await runStart(host, systemPromptOptions);
+	expect(calls.abort).toBe(1);
+	expect(results).toContainEqual({ systemPrompt: "" });
+});
+
+test("fail closed: an agent file read failure while preparing the prompt stops the run", async () => {
+	const { host } = await child("fx-spawner"); // append + inherit-append-system reads the file each run.
+	rmSync(join(h.agentsDir, "fx-spawner.md"));
+	const systemPromptOptions: any = { cwd: "/tmp", sections: {} };
+	const { calls, results } = await runStart(host, systemPromptOptions);
+	expect(calls.abort).toBe(1);
+	expect(results).toContainEqual({ systemPrompt: "" });
 });
 
 test("fail closed: a run without prompt sections (C8) stops before any model request", async () => {

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { readCatalog } from "../../src/catalog.ts";
 import type { Caller } from "../../src/launch-planner.ts";
 import { type HostFacts, planInstance } from "../../src/planner.ts";
-import { createSubagentTool, type LaunchOutcome } from "../../src/subagent-tool.ts";
+import { createSubagentTool, type LaunchOutcome, type PersistedLaunch } from "../../src/subagent-tool.ts";
 import { FakeBridge } from "../harness/fake-bridge.ts";
 import { tempHost, type TempHost } from "./sync-helpers.ts";
 
@@ -18,6 +18,8 @@ export interface LaunchFixture {
 	/** Write settings with the planned entry of every enabled agent (a fresh sync). */
 	sync(): void;
 	tool(caller?: Caller, outcomes?: LaunchOutcome[]): any;
+	/** The parent session's saved launch records (survive a new tool instance = a reload). */
+	saved: PersistedLaunch[];
 	bridge(response?: Record<string, unknown>): FakeBridge;
 	run(tool: any, bridge: FakeBridge, params: Record<string, unknown>, toolCallId?: string): Promise<any>;
 }
@@ -53,8 +55,13 @@ export function launchFixture(): LaunchFixture {
 			}
 			h.writeSettings({ providerInstances });
 		},
+		saved: [],
 		tool(caller = { agent: null, budget: null }, outcomes = []) {
 			return createSubagentTool({
+				launchStore: {
+					load: (key) => fixture.saved.filter((r) => r.key === key).at(-1),
+					save: (record) => fixture.saved.push(record),
+				},
 				env: h.env,
 				caller: () => caller,
 				thinkingLevel: () => "medium",
@@ -70,7 +77,10 @@ export function launchFixture(): LaunchFixture {
 				cwd,
 				model: { provider: "cpa", id: "claude-opus-5-5" },
 				modelRegistry: {
-					find: (_p: string, id: string) => ({ reasoning: id !== "plain-model" }),
+					find: (_p: string, id: string) =>
+						id === "glm-flash"
+							? { reasoning: true, thinkingLevelMap: { minimal: null, low: null, medium: null, xhigh: "max" } } // offers off, high, xhigh
+							: { reasoning: id !== "plain-model" },
 					getAvailable: () => [{ provider: "cpa", id: "claude-haiku-5-5" }, { provider: "cpa", id: "claude-sonnet-5-5" }],
 					getAll: () => [],
 				},

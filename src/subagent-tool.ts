@@ -9,7 +9,7 @@
 import { readFileSync } from "node:fs";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { agentsDir, projectAgentNames, readCatalog } from "./catalog.ts";
+import { type AgentDefinition, agentsDir, projectAgentNames, readCatalog } from "./catalog.ts";
 import type { HostFacts } from "./planner.ts";
 import {
 	BRIDGE_DELEGATE,
@@ -59,6 +59,42 @@ export interface SubagentToolDeps {
 	/** Host facts for the stale check (tests override). */
 	readonly hostFacts?: (settings: Settings) => Promise<HostFacts> | HostFacts;
 	readonly onOutcome?: (outcome: LaunchOutcome) => void;
+	/** Durable record of prepared launches (D23 replay across reloads); production: session entries. */
+	readonly launchStore?: LaunchStore;
+}
+
+export const LAUNCH_ENTRY = "pi-t3-subagents-launch";
+
+/** What an exact retry needs to resend the first launch unchanged. */
+export interface PersistedLaunch {
+	readonly key: string;
+	readonly name: string;
+	readonly agent: string;
+	readonly instanceId: string;
+	readonly revision: string;
+	readonly childBudget: number;
+	readonly modelLabel: string;
+	readonly args: PreparedLaunch["args"];
+}
+
+export interface LaunchStore {
+	load(key: string, ctx: any): PersistedLaunch | undefined;
+	save(record: PersistedLaunch): void;
+}
+
+/** Session entries of the parent thread: they survive /reload and resume of that session. */
+export function sessionLaunchStore(pi: ExtensionAPI): LaunchStore {
+	return {
+		load(key, ctx) {
+			const entries: any[] = ctx?.sessionManager?.getEntries?.() ?? [];
+			const found = entries.filter((e) => e?.type === "custom" && e.customType === LAUNCH_ENTRY && e.data?.key === key).at(-1);
+			const data = found?.data;
+			return data && typeof data.args?.task === "string" && typeof data.args?.clientRequestId === "string" ? (data as PersistedLaunch) : undefined;
+		},
+		save(record) {
+			(pi as any).appendEntry?.(LAUNCH_ENTRY, record);
+		},
+	};
 }
 
 /** Pi registry lookup for a bare model id: the provider hint, else the one available (or known) match. */
@@ -74,13 +110,41 @@ export function registryResolver(registry: any): (id: string, provider?: string)
 	};
 }
 
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/**
+ * Pi's getSupportedThinkingLevels (pi-ai, Pi 1.4.0), copied because pi-ai is not a declared
+ * dependency. pi-subagents treats a model without `reasoning: false` as reasoning.
+ */
+export function supportedThinkingLevels(model: { reasoning?: boolean; thinkingLevelMap?: Record<string, unknown> }): string[] {
+	if (model.reasoning === false) return ["off"];
+	return THINKING_LEVELS.filter((level) => {
+		const mapped = model.thinkingLevelMap?.[level];
+		if (mapped === null) return false;
+		if (level === "xhigh" || level === "max") return mapped !== undefined;
+		return true;
+	});
+}
+
 export function createSubagentTool(deps: SubagentToolDeps): ToolDefinition<typeof SubagentParams, undefined, any> {
 	// D23 replay: T3 replays a known clientRequestId without comparing the payload. An exact
-	// retry in this Pi process therefore reuses the first prepared launch, so shell expansion
-	// runs once per key (concurrent retries share one preparation). The cache lives in memory:
-	// after a Pi reload an exact retry prepares again (its shell commands run again), and
-	// T3 still replays the stored first launch, so no second child starts.
+	// retry therefore reuses the first prepared launch, so shell expansion runs once per key:
+	// concurrent retries share one in-memory preparation, and every prepared launch is saved
+	// in the launch store (the parent session) before the bridge call, so a retry after a
+	// reload or a memory eviction resends the saved launch without preparing again.
 	const prepared = new Map<string, Promise<PreparedLaunch>>();
+
+	function recovered(record: PersistedLaunch): PreparedLaunch {
+		const agent: AgentDefinition = readCatalog(agentsDir(deps.env)).agents.find((a) => a.name === record.agent) ?? {
+			name: record.agent,
+			path: "",
+			enabled: true,
+			fields: {},
+			envKeys: [],
+		};
+		const { key: _key, agent: _agent, ...rest } = record;
+		return { ...rest, agent };
+	}
 
 	async function prepare(params: LaunchParamsInput, toolCallId: string, ctx: any): Promise<PreparedLaunch> {
 		const path = settingsPath(deps.env);
@@ -109,6 +173,11 @@ export function createSubagentTool(deps: SubagentToolDeps): ToolDefinition<typeo
 					return found ? found.reasoning === true : true;
 				},
 				resolveModel: registryResolver(registry),
+				thinkingLevels: (slug) => {
+					const [provider, ...rest] = slug.split("/");
+					const found = registry?.find?.(provider, rest.join("/"));
+					return found ? supportedThinkingLevels(found) : undefined;
+				},
 				host,
 				settings,
 				bridgeCallable: ctx.tools.some((tool: { name: string }) => tool.name === BRIDGE_DELEGATE),
@@ -135,7 +204,14 @@ export function createSubagentTool(deps: SubagentToolDeps): ToolDefinition<typeo
 				const key = launchKey(toolCallId, 0, params);
 				let preparation = prepared.get(key);
 				if (!preparation) {
-					preparation = prepare(params, toolCallId, ctx);
+					const saved = deps.launchStore?.load(key, ctx);
+					preparation = saved
+						? Promise.resolve(recovered(saved))
+						: prepare(params, toolCallId, ctx).then((launch) => {
+								const { agent, ...rest } = launch;
+								deps.launchStore?.save({ key, ...rest, agent: agent.name });
+								return launch;
+							});
 					prepared.set(key, preparation);
 					if (prepared.size > PREPARED_KEPT) prepared.delete(prepared.keys().next().value!);
 					// A refused preparation is not kept: a retry validates again.
@@ -171,5 +247,5 @@ export function createSubagentTool(deps: SubagentToolDeps): ToolDefinition<typeo
 
 /** Production wiring: root caller unless the child runtime knows the header. */
 export function subagentToolFor(pi: ExtensionAPI, env: NodeJS.ProcessEnv, caller: () => Caller, onOutcome: (o: LaunchOutcome) => void) {
-	return createSubagentTool({ env, caller, thinkingLevel: () => pi.getThinkingLevel?.(), onOutcome });
+	return createSubagentTool({ env, caller, thinkingLevel: () => pi.getThinkingLevel?.(), onOutcome, launchStore: sessionLaunchStore(pi) });
 }
