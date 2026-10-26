@@ -29,7 +29,7 @@ import { budgetExhausted, CHILD_REFUSED_TOOLS } from "./child-tools.ts";
 import type { CompatibilityCheck } from "./doctor.ts";
 import { BRIDGE_DELEGATE } from "./launch-planner.ts";
 import { THREAD_STARTING_TOOLS } from "./planner.ts";
-import { MANAGED_BY, type Settings } from "./settings-shape.ts";
+import { MANAGED_BY, type Settings, settingsShapeProblems } from "./settings-shape.ts";
 import { settingsPath } from "./sync.ts";
 
 export const WRAPPER_TOOL = "subagent";
@@ -38,6 +38,8 @@ export const REFUSED_EXHAUSTED = (tool: string) =>
 	`${tool} is refused: this agent may not start threads or tasks (leaf agent or spawn budget exhausted, D22).`;
 export const REFUSED_CHILD_THREAD_TOOL = (tool: string) =>
 	`${tool} is refused in a pi-t3-subagents child thread (D22, owner decision 2026-10-26). Children start threads only through the subagent tool.`;
+export const REFUSED_ROOT_UNKNOWN = (id: string, why: string) =>
+	`Raw delegate_task to ${id} is refused (D22): T3 settings cannot be read (${why}), so it is unknown whether ${id} is a managed instance. Launch agents with the subagent tool, or fix the settings file.`;
 export const REFUSED_CHILD_RAW =
 	"Raw delegate_task is refused in a pi-t3-subagents child thread (D22). Launch agents with the subagent tool; it applies spawning, visibility and the spawn budget.";
 export const REFUSED_ROOT_MANAGED = (id: string) =>
@@ -54,21 +56,34 @@ export interface GuardDeps {
 	readonly env: Record<string, string | undefined>;
 	/** The managed child's runtime; undefined in a root thread. */
 	readonly child: ChildRuntime | undefined;
-	/** Override for tests; default: the T3 settings entry is marked `managedBy: pi-t3-subagents`. */
-	readonly isManagedInstance?: (id: string) => boolean;
+	/** Override for tests; default: classify the target from T3 settings (managedInstanceReader). */
+	readonly isManagedInstance?: (id: string) => boolean | Classification;
 }
 
-/** A settings entry this extension manages (any namespace). Unreadable settings: not managed. */
-export function managedInstanceReader(env: Record<string, string | undefined>): (id: string) => boolean {
+/** Managed status of a target instance. `unknown` fails closed in the root guard. */
+export type Classification = { kind: "managed" } | { kind: "not_managed" } | { kind: "unknown"; why: string };
+
+/**
+ * Classify `id` from T3 settings: managed when its entry is marked `managedBy: pi-t3-subagents`
+ * (any namespace). A missing, unreadable or unparseable file, or an unexpected shape (C6), is
+ * `unknown`: T3 can keep a loaded instance while the file on disk is broken.
+ */
+export function managedInstanceReader(env: Record<string, string | undefined>): (id: string) => Classification {
 	return (id) => {
+		let settings: Settings;
 		try {
-			const settings: Settings = JSON.parse(readFileSync(settingsPath(env as NodeJS.ProcessEnv), "utf8"));
-			return settings.providerInstances?.[id]?.config?.managedBy === MANAGED_BY;
-		} catch {
-			return false;
+			settings = JSON.parse(readFileSync(settingsPath(env as NodeJS.ProcessEnv), "utf8"));
+		} catch (error) {
+			return { kind: "unknown", why: (error as Error).message };
 		}
+		const problems = settingsShapeProblems(settings);
+		if (problems.length > 0) return { kind: "unknown", why: problems.join("; ") };
+		return settings.providerInstances?.[id]?.config?.managedBy === MANAGED_BY ? { kind: "managed" } : { kind: "not_managed" };
 	};
 }
+
+const classified = (value: boolean | Classification): Classification =>
+	typeof value === "boolean" ? { kind: value ? "managed" : "not_managed" } : value;
 
 const STARTING = new Set(THREAD_STARTING_TOOLS);
 const CHILD_REFUSED = new Set(CHILD_REFUSED_TOOLS);
@@ -116,7 +131,11 @@ export function installRawDelegationGuard(pi: ExtensionAPI, deps: GuardDeps): Ra
 		}
 		if (name === BRIDGE_DELEGATE && !fromWrapper) {
 			const id = event.input?.target?.providerInstanceId;
-			if (typeof id === "string" && isManaged(id)) return block(REFUSED_ROOT_MANAGED(id));
+			if (typeof id === "string") {
+				const status = classified(isManaged(id));
+				if (status.kind === "managed") return block(REFUSED_ROOT_MANAGED(id));
+				if (status.kind === "unknown") return block(REFUSED_ROOT_UNKNOWN(id, status.why));
+			}
 		}
 		return undefined;
 	});

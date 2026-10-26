@@ -6,6 +6,7 @@
  * Expected values come from the spec ("Spawn policy and raw-delegation guard", field mapping).
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { chmodSync, rmSync, writeFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createExtension } from "../../index.ts";
 import type { ChildRuntime, ChildState } from "../../src/child-runtime.ts";
@@ -240,6 +241,64 @@ describe("raw-delegation guard in a root thread", () => {
 		const out = await t.host.callTool("subagent", { ...base, agent: "fx-leaf" });
 		expect(out.isError).toBe(false);
 		expect(t.bridge.calls[0].args.target.providerInstanceId).toBe("t3t-fx-leaf");
+	});
+});
+
+describe("review fixes: root guard fails closed when T3 settings cannot classify the target", () => {
+	async function rootWith(settings: "unreadable" | "unparseable" | "missing" | "bad-shape") {
+		if (settings === "missing") rmSync(f.h.settingsPath);
+		else if (settings === "unparseable") writeFileSync(f.h.settingsPath, "{ not json");
+		else if (settings === "bad-shape") writeFileSync(f.h.settingsPath, JSON.stringify({ providerInstances: [] }));
+		else chmodSync(f.h.settingsPath, 0o000);
+		const host = new FakePiHost();
+		await host.load(OURS, createExtension({ ...T3, ...f.h.env }, OURS));
+		new FakeBridge().respond(DELEGATE, () => RUNNING).installOn(host);
+		host.active.add(DELEGATE);
+		await host.startSession();
+		return host;
+	}
+	for (const kind of ["unreadable", "unparseable", "missing", "bad-shape"] as const) {
+		test(`${kind} settings: a raw root call is refused from the model and from codemode`, async () => {
+			const host = await rootWith(kind);
+			for (const options of [{}, { parentToolCallId: "call-cm" }]) {
+				const raw = await host.callTool(DELEGATE, { task: "x", target: { providerInstanceId: "t3t-fx-leaf" } }, options);
+				expect(raw.blocked).toMatch(/^Raw delegate_task to t3t-fx-leaf is refused \(D22\): T3 settings cannot be read .*Launch agents with the subagent tool/);
+			}
+		});
+	}
+
+	test("readable settings: a non-managed target still passes and a managed one is refused", async () => {
+		const host = new FakePiHost();
+		await host.load(OURS, createExtension({ ...T3, ...f.h.env }, OURS));
+		const bridge = new FakeBridge().respond(DELEGATE, () => RUNNING).installOn(host);
+		host.active.add(DELEGATE);
+		await host.startSession();
+		expect((await host.callTool(DELEGATE, { task: "x", target: { providerInstanceId: "codex" } })).blocked).toBeUndefined();
+		expect((await host.callTool(DELEGATE, { task: "x", target: { providerInstanceId: "t3t-fx-leaf" } })).blocked).toMatch(/managed instance t3t-fx-leaf is refused/);
+		expect(bridge.calls).toHaveLength(1);
+	});
+});
+
+describe("review fixes: run_scheduled_task_now at budget 0", () => {
+	const RUN_NOW = "mcp__t3-code__run_scheduled_task_now";
+	test("refused from the model and from codemode; removed from the active set and the provider request", async () => {
+		const t = await thread({ caller: { agent: "fx-spawner", budget: 0 }, child: childOf({ budget: 0 }) });
+		t.host.addTool(RUN_NOW, "/t3/pi-mcp-bridge/index.ts", "direct", true, () => ({ content: [{ type: "text", text: "STARTED" }] }));
+		expect((await t.host.callTool(RUN_NOW, {})).blocked).toMatch(/is refused/);
+		expect((await t.host.callTool(RUN_NOW, {}, { parentToolCallId: "call-cm" })).blocked).toMatch(/is refused/);
+		expect(EXHAUSTED_TOOLS).toContain(RUN_NOW);
+
+		const host = new FakePiHost();
+		await host.load(OURS, (pi: ExtensionAPI) => {
+			installChildTools(pi, childOf({ budget: 0 }));
+		});
+		host.addTool("read", "builtin", "direct", true);
+		host.addTool(RUN_NOW, "/t3/pi-mcp-bridge/index.ts", "direct", true);
+		host.finishLoading();
+		await host.startSession();
+		expect([...host.active]).toEqual(["read"]);
+		const [replaced] = await host.emit("before_provider_request", { payload: { tools: [{ name: "read" }, { name: RUN_NOW }] } });
+		expect(replaced).toEqual({ tools: [{ name: "read" }] });
 	});
 });
 
