@@ -8,6 +8,11 @@
  * `t3_thread_send`. After the ping, a `tool_call` handler refuses every further tool call
  * in that run (model-issued and nested) with the ping reason.
  *
+ * caller_ping is a sequential tool: Pi 1.4.0 runs a parallel batch by preparing every call
+ * (its `tool_call` check) before executing any, so a later call in the same batch would
+ * pass the latch before the ping sets it. A sequential tool makes Pi run the whole batch
+ * one call at a time, so later calls see the latch.
+ *
  * The latch is run state of its own (not part of the header record): it resets at
  * `agent_start` and clears at `agent_end` and `session_shutdown`, so a continued run
  * (the caller's `t3_thread_send`) can use tools again.
@@ -57,6 +62,7 @@ export function installCallerPing(pi: ExtensionAPI, _child?: ChildRuntime): void
 		].join(" "),
 		promptSnippet: "Ask your caller for a decision or help and end the turn; the caller continues this thread.",
 		parameters: CallerPingParams,
+		executionMode: "sequential",
 		async execute(_toolCallId, params) {
 			const message = params.message.trim();
 			if (!message) throw new Error(`${CALLER_PING_TOOL} needs a non-empty message.`);
