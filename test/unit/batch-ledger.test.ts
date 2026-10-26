@@ -165,6 +165,8 @@ test("batch: two synchronous children and one asynchronous child all start befor
 	expect(blocks[0]).toContain("SYNC-ONE-DONE");
 	expect(blocks[1]).toContain("Completion wakes this thread");
 	expect(blocks[2]).toContain("waits for input in its thread");
+	// U19 (live S4): a completion wake follows a wait that ended on a question.
+	expect(blocks[2]).toContain("When the child finishes, a completion wake comes");
 	expect(blocks[3]).toContain("The child still runs; a wake comes when it finishes.");
 	// The finished child released its slot; the others are live.
 	expect(ledger.snapshot().live.map((t) => t.taskId).sort()).toEqual(["task-2", "task-3", "task-4"]);

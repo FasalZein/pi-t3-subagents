@@ -423,7 +423,8 @@ export function itemText(item: LaunchItem): string {
 	const body: Record<LaunchState, string> = {
 		running: "The child runs in its own T3 thread. Completion wakes this thread; end your turn now.",
 		finished: `The child already finished [${item.status}]; no wake will come. Its reply:\n${item.summary ?? "(no reply text)"}`,
-		waiting: "The child waits for input in its thread (question or approval). A wake may follow when it settles (unverified, U19).",
+		waiting:
+			"The child waits for input in its thread (question or approval). T3 tells this thread about a pending question; answer it there or let the user answer it. When the child finishes, a completion wake comes (U19, verified for a question).",
 		wait_timed_out: "The wait reached its limit. The child still runs; a wake comes when it finishes.",
 	};
 	const lifecycle = [
