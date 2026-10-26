@@ -175,6 +175,35 @@ test("run A schedules, run B starts, A's timer fires late: A cannot warn or abor
 	expect(r.aborts).toEqual([110_000]);
 });
 
+test("a warning that Pi records only after the abort is removed from later model requests, also after a reload", async () => {
+	const r = await rig({ timeout: "100", "timeout-warn-threshold": "50" });
+	await runStart(r);
+	at(r, 50);
+	at(r, 100); // the steer is still queued behind a long tool call when the run stops
+	const warning = r.steers[0].text;
+	await deliver(r, warning); // Pi flushes it into the transcript after the abort
+	await settle(r);
+	const user = (text: string) => ({ role: "user", content: [{ type: "text", text }] });
+	const transcript = [user("task"), { role: "assistant", content: [] }, user(warning), user("follow-up")];
+	const [result] = (await r.host.emit("context", { messages: transcript }, r.ctx)) as any[];
+	expect(result.messages.map((m: any) => m.content[0]?.text)).toEqual(["task", undefined, "follow-up"]);
+	// After a reload the saved entry keeps the filter.
+	resetCopyRegistry();
+	const next = await rig({}, { entries: r.host.entries });
+	const [again] = (await next.host.emit("context", { messages: transcript }, next.ctx)) as any[];
+	expect(again.messages).toHaveLength(3);
+});
+
+test("a warning delivered while its run is live stays in the transcript", async () => {
+	const r = await rig({ timeout: "100", "timeout-warn-threshold": "50" });
+	await runStart(r);
+	at(r, 50);
+	await deliver(r, r.steers[0].text);
+	const transcript = [{ role: "user", content: [{ type: "text", text: r.steers[0].text }] }];
+	const [result] = (await r.host.emit("context", { messages: transcript }, r.ctx)) as any[];
+	expect(result).toBeUndefined();
+});
+
 test("session_shutdown clears the timers of the active run", async () => {
 	const r = await rig({ timeout: "100", "timeout-warn-threshold": "50" });
 	await runStart(r);

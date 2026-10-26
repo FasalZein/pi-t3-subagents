@@ -28,6 +28,14 @@ import type { ManagedChildToolInstaller } from "./managed-child-tools.ts";
 export const CONTEXT_WARNINGS_ENTRY = "pi-t3-subagents-context-warnings";
 /** Session entry written when the time limit stops a run. */
 export const RUN_LIMIT_ENTRY = "pi-t3-subagents-run-limit";
+/**
+ * Session entry naming a time-limit warning that Pi recorded only after its run was stopped.
+ * Observed live (Pi 1.4.0 in T3, 2026-10-26): a steer still queued at the abort is written
+ * into the transcript after the aborted tool result. The model of that run never saw it,
+ * and a follow-up run would read "N s remain" as current. Such warnings are removed from
+ * later model requests through the `context` event; the session file keeps them.
+ */
+export const STALE_WARNING_ENTRY = "pi-t3-subagents-stale-time-warning";
 
 const DEFAULT_CONTEXT_WARN_STEP = 5;
 /** pi-subagents: `timeout-warn-threshold: true` means 80%. */
@@ -213,6 +221,10 @@ export function installRunLimits(pi: ExtensionAPI, child: ChildRuntime, definiti
 	const sent = new Set<number>();
 	const pending = new Set<number>();
 	const pendingMessages = new Map<string, number[]>();
+	// Time-limit warnings sent but not yet in the transcript, by generation id; and the
+	// warnings that reached the transcript only after their run was stopped.
+	const undeliveredWarnings = new Map<string, number>();
+	const staleWarnings = new Set<string>();
 
 	const readLimits = (): RunLimits => {
 		try {
@@ -243,7 +255,9 @@ export function installRunLimits(pi: ExtensionAPI, child: ChildRuntime, definiti
 			generation.timers.push(
 				clock.setTimeout(() => {
 					if (!live()) return;
-					steer(timeoutWarning(timeoutSeconds, Math.round((clock.now() - generation.startedAt) / MS_PER_SECOND)));
+					const text = timeoutWarning(timeoutSeconds, Math.round((clock.now() - generation.startedAt) / MS_PER_SECOND));
+					undeliveredWarnings.set(text, generation.id);
+					steer(text);
 				}, (limitMs * timeoutWarnThreshold) / 100),
 			);
 		}
@@ -284,6 +298,8 @@ export function installRunLimits(pi: ExtensionAPI, child: ChildRuntime, definiti
 		pending.clear();
 		pendingMessages.clear();
 		const entries = ((ctx as Ctx)?.sessionManager?.getEntries?.() ?? []) as any[];
+		for (const e of entries)
+			if (e?.type === "custom" && e.customType === STALE_WARNING_ENTRY && typeof e.data?.text === "string") staleWarnings.add(e.data.text);
 		const saved = entries.filter((e) => e?.type === "custom" && e.customType === CONTEXT_WARNINGS_ENTRY && Array.isArray(e.data?.sentThresholds)).at(-1);
 		for (const level of saved?.data.sentThresholds ?? []) if (typeof level === "number") sent.add(level);
 	});
@@ -294,6 +310,15 @@ export function installRunLimits(pi: ExtensionAPI, child: ChildRuntime, definiti
 
 	pi.on("message_end", async (event) => {
 		const text = messageText((event as any).message);
+		const warningGeneration = text === undefined ? undefined : undeliveredWarnings.get(text);
+		if (warningGeneration !== undefined) {
+			undeliveredWarnings.delete(text as string);
+			if (current?.id !== warningGeneration) {
+				staleWarnings.add(text as string);
+				pi.appendEntry(STALE_WARNING_ENTRY, { text });
+			}
+			return;
+		}
 		const levels = text === undefined ? undefined : pendingMessages.get(text);
 		if (!levels) return;
 		pendingMessages.delete(text as string);
@@ -320,6 +345,16 @@ export function installRunLimits(pi: ExtensionAPI, child: ChildRuntime, definiti
 		}
 		if (last?.stopReason === "toolUse") return;
 		checkContext(ctx as Ctx);
+	});
+
+	pi.on("context", async (event) => {
+		if (staleWarnings.size === 0) return;
+		const messages: any[] = (event as any).messages ?? [];
+		const kept = messages.filter((m) => {
+			const text = messageText(m);
+			return text === undefined || !staleWarnings.has(text);
+		});
+		if (kept.length !== messages.length) return { messages: kept };
 	});
 
 	pi.on("agent_settled", async () => {
