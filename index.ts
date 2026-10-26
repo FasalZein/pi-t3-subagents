@@ -31,6 +31,10 @@ import { type LaunchOutcome, subagentToolFor } from "./src/subagent-tool.ts";
 import { registerSyncCommand } from "./src/sync-command.ts";
 import { installTakeover, isInsideT3, takeoverChecks } from "./src/takeover.ts";
 import { installManagedChildTools } from "./src/managed-child-tools.ts";
+import { guardCheck, installRawDelegationGuard } from "./src/raw-delegation-guard.ts";
+import { installChildTools } from "./src/child-tools.ts";
+import { installLedger, wakeFormatCheck } from "./src/ledger.ts";
+import { ledgerOf } from "./src/subagent-tool.ts";
 
 type Env = Record<string, string | undefined>;
 
@@ -57,8 +61,15 @@ export function createExtension(env: Env = process.env, copyId: string = import.
 				enabled: takeover.state().kind === "registered",
 			}));
 		// [slot S5] nested policy, raw-delegation guard, child tool exposure: begin
+		// Every copy installs the guard: a duplicate block is harmless, and a missing one is not.
+		if (insideT3) {
+			doctor.register(guardCheck(installRawDelegationGuard(pi, { env, child })));
+			if (child) installChildTools(pi, child);
+		}
 		// [slot S5] end
 		// [slot S4] batches, synchronous calls, width ledger (C5): begin
+		if (insideT3) installLedger(pi as any, ledgerOf(tool));
+		doctor.register(wakeFormatCheck(ledgerOf(tool)));
 		// [slot S4] end
 		// Managed-child tools and child-run handlers: only in a managed child, only in the copy
 		// that owns the takeover, so a second copy cannot register a duplicate tool or a second timer.
