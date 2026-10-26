@@ -386,7 +386,7 @@ Unverified facts, each closed by a slice acceptance check:
 
 | Id | Fact to verify | Slice |
 |---|---|---|
-| U1 | Two approvals per launch in `approval-required` mode. | S9 |
+| U1 | Two approvals per launch in `approval-required` mode. | S9: passed 2026-10-26 (live, T3 Nightly, Supervised): the parent asks for the `subagent` call and then for its nested `mcp__t3-code__delegate_task` call; a `subagent` call from a codemode script adds one approval for the codemode call. The child thread opens in Supervised mode and asks for its own commands in its own thread; the parent view shows "Open approval". Documented in the README. |
 | U2 | Named `mcp__t3-code__*` entries in `--tools` keep those bridge tools active in a child. | S5 |
 | U3 | A parent on a main instance can call the deferred `task_cancel` and `t3_thread_send`. | S6 |
 | U4 | `config.managedBy` and `config.namespace` survive a T3 UI settings edit. | S2 |
