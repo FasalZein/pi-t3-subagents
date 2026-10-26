@@ -1,0 +1,43 @@
+[
+ [
+  "open",
+  "http://127.0.0.1:3773/"
+ ],
+ [
+  "wait",
+  "--text",
+  "t3-subagents-e2e"
+ ],
+ [
+  "find",
+  "role",
+  "button",
+  "click",
+  "--name",
+  "Use the subagent tool exactly twice"
+ ],
+ [
+  "wait",
+  "--text",
+  "Both children finished"
+ ],
+ [
+  "wait",
+  "--text",
+  "Leaf override check"
+ ],
+ [
+  "wait",
+  "--text",
+  "Shell expansion check"
+ ],
+ [
+  "wait",
+  "--text",
+  "Lineage"
+ ],
+ [
+  "screenshot",
+  "/tmp/t3e2e-s3-flow-lineage.png"
+ ]
+]
