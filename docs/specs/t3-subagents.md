@@ -155,6 +155,7 @@ Stopping, continuing and reading children use T3's native tools (`task_cancel`, 
 | D31 | Update safety: never edit T3, Pi or pi-subagents install files; write only owned settings entries; startup checks plus `/t3-subagents-doctor`. |
 | D32 | Broken accounting (an unreadable wake) fails open with a notice. Safety rules do not depend on T3 text and stay enforced. |
 | D34 | Ledger ordering prefers freeing slots (owner decision 2026-10-26, S4 final review). Any terminal observation of a child thread (a terminal `t3_thread_read`, a final `task_status`, a wake, a `task_cancel` result) ends every live task of that thread and every `t3_thread_send` to it that still waits for its response, whatever the arrival order. A later non-final response may make a task live only when it names a task id the ledger has not seen closed. Accepted risk: width can be briefly undercounted, so one extra child may start; a slot is never stuck. Like D32, this is accounting, not a safety rule. |
+| D35 | Question relay (owner decision 2026-10-26, after the S8 live finding): when a child asks a question, the user answers in the child thread. The launch result (state `waiting`, and `running` for interactive agents) and the roster tell the parent: "The user answers in the child thread. Do not ask the question again and do not relay it; end your turn." |
 | D33 | Slice graph for parallel workers (see "Delivery Slices"). Build: one worker per slice, model cpa/claude-opus-5-5. |
 | Seams | One main test seam (fake Pi host plus fake T3 bridge), real Pi probes, live T3 e2e. |
 
@@ -335,13 +336,15 @@ Remaining risk, stated in the README: a T3 settings save that falls between step
 | C6 | T3 settings shape: `providerInstances`, `config` keeps unknown keys, `environment` entries | Sync and doctor | Sync refuses to write and names the unexpected shape |
 | C7 | `launchArgs` tokenizer and reserved flags | Sync validation; doctor shows instance availability | Agent skipped, or instance unavailable in T3 |
 | C8 | Pi extension API: `before_agent_start` prompt sections, `input` transform, `tool_call` `parentToolCallId`, `setActiveTools`, `registerTool` at session start | Doctor | Feature disabled with notice; the guard fails closed |
-| C9 | pi-subagents frontmatter rules (copied in the agent catalog) | None automatic | Documented; re-check after pi-subagents updates |
-| C10 | T3 reloads changed instances asynchronously | Child revision check | Stale reply (D28) |
+| C9 | pi-subagents frontmatter rules (copied in the agent catalog) | Doctor: every agent file is readable and uses only mapped or gap fields; the parser rules themselves are not checked automatically | Documented; re-check after pi-subagents updates |
+| C10 | T3 reloads changed instances asynchronously | Child revision check; doctor: a child's stale state, and managed instances that a sync would still change | Stale reply (D28); launch refused (D13) |
 
 ### T3 facts the design uses
 
 - Direct bridge tools: `orchestrator_capabilities`, `delegate_task`, `task_status`; the others are deferred only while Pi's built-in tool-search is present, otherwise direct.
 - Wake: `Delegated task <taskId> (<title>) [<status>]:` plus the child's last reply, or a short form that points to `task_status` once the 16,000-byte inline budget per wake is used.
+- Other wake and notice formats (installed bundle, S4 live run): `Delegated task <taskId> reached a terminal state` (also with `. Use task_status ...`) and `Delegated tasks <a>, <b> reached terminal states. ...` end the tasks. The question notices `Delegated task <taskId> is blocked on a question and cannot continue until it is answered.` and `Delegated task <taskId> asked a question and is still working.` keep the task live. An async interactive child that asks a question also wakes the parent with `Child <title> (<agent>) asks: <question>` (S8 live run); this text is not a ledger event.
+- A run stopped by `timeout` ends with task and thread status `interrupted`; the wake is `[interrupted]` with the body `Child task ended with status interrupted.` and no child reply (S7 live run). A user stop in the child thread gives the same wake (U9, S4).
 - `mode: "wait"` ends on a final status, a child question, a child approval, or its time limit; a completed wait delivers the result and no later wake.
 - Reading a final result with `task_status` or `t3_thread_read` marks it read and suppresses the wake. An async launch whose child already finished is marked read at once.
 - `t3_thread_send` to a finished child starts a new task with a new id; its end wakes the sender.
@@ -423,6 +426,11 @@ Recorded by the integration prep (issue #11) from the final S3 review (Part 2). 
 | **S6: caller ping** | No S3 behavior file. | A new caller-ping module (for example `src/caller-ping.ts`); managed-child registration, ping result, per-run tool-call latch and cleanup tests; the live ping, continue and cancel flow. | Keep `src/child-runtime.ts` and the launch modules unchanged. Use independent Pi run lifecycle state; do not add ping state to the budget and header record. |
 | **S7: context and time limits** | No S3 behavior file. | A new run-limits module (for example `src/run-limits.ts`) that reads its thresholds from the current agent definition through env and the catalog, or an injected getter. Fake-clock and context tests; live proof of the timeout status. | Keep `src/child-runtime.ts` and the launch modules unchanged. Scope timers to one run generation; clear them at run end and at runtime shutdown. |
 | **S8: interactive behavior** | Only `isInteractive`, `INTERACTIVE_HINT` and the hint and summary selection in `firstMessage` in `src/launch-planner.ts`. | Its own interactive tests, fixtures and browser flow. An interactive module only if the real flow needs behavior beyond the existing hint path. | No policy, target-resolution, wait/result, `src/subagent-tool.ts` or `src/child-runtime.ts` edits. Keep the order of header, skills and role block. |
+
+Ownership exceptions recorded by the integration owner (S9):
+
+- S4 changed two lines of S1's `test/unit/doctor.test.ts` (the healthy-session test title and its expected list gained C5), the minimal consequence of registering C5. The S4 reviewer accepted it as a narrow exception.
+- S9 owns the integration leftovers: the lifecycle tool spellings and the D35 sentence in `src/roster.ts` and `src/takeover.ts`, `LIFECYCLE` exported from `src/launch-planner.ts` for them, `GAP_FIELDS` exported from `src/planner.ts` for C9, and C9 and C10 in `src/doctor-checks.ts`.
 
 Shared seams from the integration prep (no slice edits them except as stated):
 

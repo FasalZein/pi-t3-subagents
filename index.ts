@@ -93,7 +93,7 @@ export function createExtension(env: Env = process.env, copyId: string = import.
 		doctor.register(bridgeToolsCheck(pi));
 		doctor.register(launchContractCheck(() => lastLaunch));
 		doctor.register(extensionApiCheck(pi, child));
-		for (const check of syncDoctorChecks(env)) doctor.register(check);
+		for (const check of syncDoctorChecks(env, child)) doctor.register(check);
 		registerDoctorCommand(pi, doctor);
 		registerSyncCommand(pi, env); // A7: registered whenever the extension loads, also outside T3.
 	};

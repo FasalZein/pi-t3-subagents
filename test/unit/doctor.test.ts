@@ -1,5 +1,5 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createExtension } from "../../index.ts";
@@ -46,6 +46,16 @@ async function doctorLines(host: FakePiHost): Promise<Map<string, string>> {
 	);
 }
 
+async function doctorLinesWith(extra: Record<string, string>): Promise<Map<string, string>> {
+	const env: Record<string, string | undefined> = { ...T3_ENV, ...extra };
+	const host = new FakePiHost();
+	await host.load(OURS, createExtension(env, OURS));
+	await host.load("/pkg/pi-subagents/src/index.ts", fakePiSubagents(env));
+	await host.startSession();
+	addBridge(host);
+	return doctorLines(host);
+}
+
 async function boot(extra: Array<[string, (pi: any) => void]> = [], copies: string[] = [OURS]) {
 	const env: Record<string, string | undefined> = { ...T3_ENV };
 	const host = new FakePiHost();
@@ -57,11 +67,11 @@ async function boot(extra: Array<[string, (pi: any) => void]> = [], copies: stri
 }
 
 describe("doctor inside T3", () => {
-	test("healthy session: C1 to C8 pass", async () => {
+	test("healthy session: C1 to C10 pass", async () => {
 		const host = await boot();
 		addBridge(host);
 		const lines = await doctorLines(host);
-		expect([...lines.keys()]).toEqual(["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8"]);
+		expect([...lines.keys()]).toEqual(["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10"]);
 		for (const line of lines.values()) expect(line).toContain(" PASS ");
 	});
 
@@ -87,6 +97,37 @@ describe("doctor inside T3", () => {
 		const c3 = (await doctorLines(host)).get("C3") ?? "";
 		expect(c3).toContain(" FAIL ");
 		expect(c3).toContain("mcp__t3-code__task_cancel is not registered");
+	});
+
+	test("C9 fails and names an agent field that pi-subagents parses but the wrapper does not know", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "doctor-agents-"));
+		try {
+			writeFileSync(join(dir, "fx-new.md"), "---\nname: fx-new\ndescription: New\nfancy-new-field: 3\n---\nBody\n");
+			writeFileSync(join(dir, "fx-ok.md"), "---\nname: fx-ok\ndescription: Ok\nllm-as-a-verifier: true\n---\nBody\n");
+			const lines = await doctorLinesWith({ PI_T3_AGENTS_DIR: dir });
+			const c9 = lines.get("C9") ?? "";
+			expect(c9).toContain(" FAIL ");
+			expect(c9).toContain("fancy-new-field");
+			expect(c9).toContain("fx-new");
+			expect(c9).not.toContain("llm-as-a-verifier"); // A documented gap is a known field.
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("C10 fails when an agent file differs from its managed instance (sync pending)", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "doctor-agents-"));
+		try {
+			mkdirSync(join(dir, "agents"));
+			writeFileSync(join(dir, "agents", "fx-leaf.md"), "---\nname: fx-leaf\ndescription: Leaf\n---\nBody\n");
+			const lines = await doctorLinesWith({ PI_T3_AGENTS_DIR: join(dir, "agents"), PI_CODING_AGENT_DIR: dir, PI_T3_NAMESPACE: "t3e2e-doc-" });
+			const c10 = lines.get("C10") ?? "";
+			expect(c10).toContain(" FAIL ");
+			expect(c10).toContain("t3e2e-doc-fx-leaf");
+			expect(c10).toContain("/t3-sync-agents");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	test("C3 fails when delegate_task is direct but inactive", async () => {

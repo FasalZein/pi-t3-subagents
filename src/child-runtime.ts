@@ -9,7 +9,8 @@
  *   revision, and replace the input with the stale instruction on a revision mismatch (D28).
  *
  * Seams for later slices: `ChildRuntime.state()` gives the header facts (S5 budget and
- * guard); S7 adds caller ping, context warnings and the time limit next to these handlers.
+ * guard); S6 adds caller ping and S7 the context warnings and time limit, both as
+ * managed-child tools (src/managed-child-tools.ts), not in this module.
  */
 import { readFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";

@@ -208,7 +208,7 @@ export const PRE_EXTENSION_PI_VARIABLES = new Set([
 ]);
 
 /** Fields with no T3 meaning (spec "Field mapping", Gaps). */
-const GAP_FIELDS: Record<string, string> = {
+export const GAP_FIELDS: Record<string, string> = {
 	"report-context-usage": "report-context-usage: T3 owns the wake text",
 	cwd: "cwd: not supported in T3",
 	"deny-env": "deny-env: not supported in T3",

@@ -4,7 +4,10 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AgentDefinition } from "./catalog.ts";
-import { isInteractive, mayLaunch } from "./launch-planner.ts";
+import { ANSWER_IN_CHILD, isInteractive, LIFECYCLE, mayLaunch } from "./launch-planner.ts";
+
+/** The same spellings as the launch result: public bridge name, then the codemode call. */
+const call = (tool: keyof typeof LIFECYCLE, args: string) => `${LIFECYCLE[tool][0]} ${args} (codemode: ${LIFECYCLE[tool][1]}(${args}))`;
 
 export const ROSTER_TYPE = "pi-t3-subagents-roster";
 
@@ -24,7 +27,8 @@ export function rosterText(agents: readonly AgentDefinition[], callerAgent: stri
 		"Agents you can launch with the subagent tool. Each launch starts a T3 Code child thread with lineage to this thread.",
 		...lines,
 		"Lifecycle in T3: an async launch returns at once; the child's completion wakes this thread with its final reply, so end your turn. A launch result with state finished already carries the reply and no wake comes.",
-		"Stop a child with task_cancel {taskId}. Continue a finished child with t3_thread_send {threadId: childThreadId, message}; its completion wakes this thread again. task_status {taskId} marks a finished result read and suppresses its wake.",
+		`Stop a child with ${call("cancel", "{taskId}")}. Continue a finished child with ${call("send", "{threadId: childThreadId, message}")}; its completion wakes this thread again. ${call("status", "{taskId}")} marks a finished result read and suppresses its wake.`,
+		`When a child asks a question (a launch result with state waiting, or a wake that says the child asks or is blocked on a question): ${ANSWER_IN_CHILD}`,
 		"subagent_resume and subagent_kill do not work in T3.",
 	].join("\n");
 }

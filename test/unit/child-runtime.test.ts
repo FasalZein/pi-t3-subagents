@@ -265,6 +265,13 @@ test("the roster lists only enabled global agents the caller may launch, with T3
 	expect(root).toContain("task_cancel");
 	expect(root).toContain("t3_thread_send");
 	expect(root).toContain("suppresses its wake");
+	// Same tool names as the launch result: the public bridge name and the codemode spelling.
+	for (const tool of ["task_cancel", "t3_thread_send", "task_status"]) {
+		expect(root).toContain(`mcp__t3-code__${tool}`);
+		expect(root).toContain(`tools.mcp__t3_code__${tool}`);
+	}
+	// Owner decision (S8): questions are answered in the child thread.
+	expect(root).toContain("The user answers in the child thread. Do not ask the question again and do not relay it; end your turn.");
 	const fromSpawner = rosterText(agents, "fx-spawner")!;
 	expect(fromSpawner).toContain("- fx-env:");
 	expect(fromSpawner).not.toContain("- fx-spawner:");

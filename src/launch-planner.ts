@@ -426,7 +426,7 @@ export const ANSWER_IN_CHILD =
 	"The user answers in the child thread. Do not ask the question again and do not relay it; end your turn. The child's final reply wakes this thread.";
 
 /** Lifecycle tools: the public bridge name, and the codemode spelling of that same tool. */
-const LIFECYCLE = {
+export const LIFECYCLE = {
 	cancel: ["mcp__t3-code__task_cancel", "tools.mcp__t3_code__task_cancel"],
 	send: ["mcp__t3-code__t3_thread_send", "tools.mcp__t3_code__t3_thread_send"],
 	status: ["mcp__t3-code__task_status", "tools.mcp__t3_code__task_status"],

@@ -206,6 +206,21 @@ describe("disabled native tools cannot run on any call path", () => {
 		});
 	}
 
+	test("a blocked pi-subagents lifecycle tool names the T3 tools in their public and codemode spellings", async () => {
+		const env = { ...T3_ENV };
+		const host = new FakePiHost();
+		await host.load(OURS, createExtension(env, OURS));
+		await host.load(PI_SUBAGENTS, fakePiSubagents(env));
+		await host.startSession();
+		host.active.add("subagent_kill");
+		const call = await host.callTool("subagent_kill", {});
+		for (const tool of ["task_cancel", "t3_thread_send", "task_status"]) {
+			expect(call.blocked).toContain(`mcp__t3-code__${tool}`);
+			expect(call.blocked).toContain(`tools.mcp__t3_code__${tool}`);
+		}
+		expect(call.blocked).toContain("The user answers in the child thread. Do not ask the question again and do not relay it; end your turn.");
+	});
+
 	test("the T3 subagent itself is not blocked when nested", async () => {
 		const host = await boot({ ...T3_ENV });
 		await host.startSession();

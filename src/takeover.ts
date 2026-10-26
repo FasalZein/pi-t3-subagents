@@ -22,6 +22,12 @@
  */
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { CompatibilityCheck } from "./doctor.ts";
+import { ANSWER_IN_CHILD, LIFECYCLE } from "./launch-planner.ts";
+
+/** The launch result's spellings: public bridge name plus the codemode spelling. */
+const LIFECYCLE_NAMES = Object.values(LIFECYCLE)
+	.map(([name, codemode]) => `${name} (codemode: ${codemode})`)
+	.join(", ");
 
 export const URL_ENV = "T3_MCP_URL";
 export const TOKEN_ENV = "T3_MCP_BEARER_TOKEN";
@@ -145,8 +151,8 @@ export function installTakeover(pi: ExtensionAPI, options: TakeoverOptions): Tak
 		const why =
 			state.kind === "suppression_failed"
 				? "delegation is off in this session (a foreign subagent tool was registered; run /t3-subagents-doctor)"
-				: "pi-subagents' children would be invisible to T3; use the T3 subagent tool and T3's task_cancel, t3_thread_send and task_status";
-		return { block: true, reason: `pi-t3-subagents: ${event.toolName} is disabled inside T3 Code: ${why}.` };
+				: `pi-subagents' children would be invisible to T3; use the T3 subagent tool, and stop, continue and read children with ${LIFECYCLE_NAMES}. When a child asks a question: ${ANSWER_IN_CHILD}`;
+		return { block: true, reason: `pi-t3-subagents: ${event.toolName} is disabled inside T3 Code: ${why.replace(/\.$/, "")}.` };
 	});
 
 	pi.on("session_start", async () => {
