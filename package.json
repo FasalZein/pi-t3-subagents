@@ -1,0 +1,8 @@
+{
+  "name": "pi-t3-subagents",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Pi extension: inside T3 Code, route pi-subagents launches to T3 delegate_task child threads.",
+  "type": "module",
+  "pi": { "extensions": ["./index.ts"] }
+}
