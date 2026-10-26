@@ -4,7 +4,8 @@
  * argument) and the user's settings packages, which include the real pi-subagents.
  * PI_DENY_TOOLS and pi-subagents child variables are removed from the probe environment.
  *
- * Run: heavy -- bun test test/probe   (needs `pi` on PATH and pi-subagents installed).
+ * Run: heavy -- bun test test/probe   (needs pi-subagents installed). The host Pi comes from
+ * ./host-pi.ts (PATH outside node_modules, or PROBE_PI); each receipt records its path and version.
  * The negative probe makes one small model call (PROBE_MODEL, default cpa/claude-haiku-5-5).
  * Set PROBE_ARTIFACT_DIR to keep the probe logs.
  */
@@ -12,13 +13,13 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { hostPath, hostPi } from "./host-pi.ts";
 
 const ROOT = resolve(import.meta.dir, "../..");
 const OURS = join(ROOT, "index.ts");
 const PROBE = join(ROOT, "test/fixtures/probe-extension.ts");
 const FOREIGN = join(ROOT, "test/fixtures/foreign-subagent.ts");
 const MODEL = process.env.PROBE_MODEL ?? "cpa/claude-haiku-5-5";
-const PI = process.env.PROBE_PI ?? "pi";
 const T3_ENV = { T3_MCP_URL: "http://127.0.0.1:9/mcp", T3_MCP_BEARER_TOKEN: "probe-fake-token" };
 const NOTICE_TYPE = "pi-t3-subagents-notice";
 const UNSET = "<unset>";
@@ -36,6 +37,7 @@ function probeEnv(label: string, out: string, insideT3: boolean, denyTools?: str
 	}
 	if (insideT3) Object.assign(env, T3_ENV);
 	if (denyTools !== undefined) env.PI_DENY_TOOLS = denyTools;
+	env.PATH = hostPath(env.PATH);
 	env.PROBE_OUT = out;
 	env.PROBE_LABEL = label;
 	return env;
@@ -49,7 +51,7 @@ class RpcPi {
 	readonly proc;
 
 	constructor(args: string[], env: Record<string, string>) {
-		this.proc = Bun.spawn([PI, "--mode", "rpc", "--no-session", ...args], { env, cwd: tmpdir(), stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+		this.proc = Bun.spawn([hostPi().path, "--mode", "rpc", "--no-session", ...args], { env, cwd: tmpdir(), stdin: "pipe", stdout: "pipe", stderr: "pipe" });
 		void this.read();
 	}
 
@@ -144,7 +146,7 @@ async function runProbe(
 	const keep = process.env.PROBE_ARTIFACT_DIR;
 	if (keep) {
 		mkdirSync(keep, { recursive: true });
-		writeFileSync(join(keep, `probe-${label}.json`), JSON.stringify({ label, args, ...run, stdout: pi.stdout.length }, null, 2));
+		writeFileSync(join(keep, `probe-${label}.json`), JSON.stringify({ label, pi: hostPi(), args, ...run, stdout: pi.stdout.length }, null, 2));
 		writeFileSync(join(keep, `probe-${label}.stderr.log`), stderr);
 	}
 	return run;
@@ -155,6 +157,12 @@ function tool(run: ProbeRun, name: string): ToolRow | undefined {
 }
 
 describe("real Pi probes", () => {
+	test("the host Pi is the installed one, not the type-only dev dependency", () => {
+		const pi = hostPi();
+		expect(pi.realPath).not.toContain(ROOT);
+		console.log(`probe host Pi: ${pi.path} -> ${pi.realPath} (version ${pi.version})`);
+	});
+
 	test(
 		"outside T3: pi-subagents' three tools are unchanged",
 		async () => {

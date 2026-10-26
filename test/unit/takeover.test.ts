@@ -3,6 +3,8 @@ import { createExtension } from "../../index.ts";
 import { resetCopyRegistry } from "../../src/takeover.ts";
 import { FakePiHost, fakeForeignSubagent, fakePiSubagents } from "../harness/fake-pi.ts";
 
+const EXPOSURES = ["direct", "codemode", "deferred"] as const;
+
 const OURS = "/ext/pi-t3-subagents/index.ts";
 const PI_SUBAGENTS = "/pkg/pi-subagents/src/index.ts";
 const FOREIGN = "/pkg/foreign-subagent/index.ts";
@@ -163,5 +165,94 @@ describe("two copies of this extension", () => {
 		expect(host.toolSource("subagent")).toBe(OURS);
 		expect("PI_DENY_TOOLS" in env).toBe(false);
 		expect(await host.startRun()).toEqual([]);
+	});
+});
+
+describe("disabled native tools cannot run on any call path", () => {
+	for (const exposure of EXPOSURES) {
+		test(`foreign subagent with exposure ${exposure}: nested and model calls are blocked`, async () => {
+			const host = await boot({ ...T3_ENV }, [[FOREIGN, fakeForeignSubagent(exposure)]]);
+			await host.startSession();
+			if (exposure !== "direct") {
+				const nested = await host.callTool("subagent", {}, { parentToolCallId: "codemode-1" });
+				expect(nested.result).toBeUndefined();
+				expect(nested.blocked).toContain("delegation is off");
+			}
+			// Another extension (or tool_search) activates it again: a model call is blocked too.
+			host.active.add("subagent");
+			const model = await host.callTool("subagent", {});
+			expect(model.result).toBeUndefined();
+			expect(model.blocked).toContain("delegation is off");
+		});
+
+		test(`pi-subagents kill and resume with exposure ${exposure} are blocked in T3`, async () => {
+			const host = new FakePiHost();
+			await host.load(OURS, createExtension({ ...T3_ENV }, OURS));
+			// A pi-subagents version that ignores PI_DENY_TOOLS registers all three.
+			await host.load(PI_SUBAGENTS, fakePiSubagents({}, exposure));
+			await host.startSession();
+			for (const name of ["subagent", "subagent_resume", "subagent_kill"]) {
+				host.active.add(name);
+				const call = await host.callTool(name, {}, { parentToolCallId: "codemode-1" });
+				expect(call.result).toBeUndefined();
+				expect(call.blocked).toContain(`${name} is disabled inside T3 Code`);
+			}
+		});
+	}
+
+	test("the T3 subagent itself is not blocked when nested", async () => {
+		const host = await boot({ ...T3_ENV });
+		await host.startSession();
+		// Not blocked: the spike tool runs and rejects the empty agent itself.
+		await expect(host.callTool("subagent", {}, { parentToolCallId: "codemode-1" })).rejects.toThrow("unsupported agent");
+	});
+
+	test("outside T3 nothing is blocked", async () => {
+		const host = await boot({});
+		await host.startSession();
+		for (const name of ["subagent", "subagent_resume", "subagent_kill"]) {
+			expect((await host.callTool(name, {})).result?.content[0].text).toBe(`${name} EXECUTED`);
+		}
+	});
+});
+
+describe("copies across runtime replacement (/reload, new session)", () => {
+	async function generation(copies: string[]) {
+		const env: Env = { ...T3_ENV };
+		const host = new FakePiHost();
+		for (const copy of copies) await host.load(copy, createExtension(env, copy));
+		await host.load(PI_SUBAGENTS, fakePiSubagents(env));
+		await host.startSession();
+		host.messages.length = 0;
+		await host.runCommand("t3-subagents-doctor");
+		const c2 = String(host.messages[0]?.content).split("\n").find((line) => line.startsWith("C2 ")) ?? "";
+		return { host, env, c2 };
+	}
+
+	test("a reload with one copy left counts one copy; a copy that was second becomes the owner", async () => {
+		const first = await generation(["/first/index.ts", "/extra/index.ts"]);
+		expect(first.c2).toContain("C2 FAIL");
+		await first.host.shutdown("reload");
+
+		const second = await generation(["/first/index.ts"]);
+		expect(second.c2).toContain("C2 PASS");
+		expect(second.host.toolSource("subagent")).toBe("/first/index.ts");
+		await second.host.shutdown("new");
+
+		const third = await generation(["/extra/index.ts"]);
+		expect(third.c2).toContain("C2 PASS");
+		expect(third.host.toolSource("subagent")).toBe("/extra/index.ts");
+		expect(third.host.tools.has("subagent_resume")).toBe(false);
+		expect(third.host.active.has("subagent_kill")).toBe(false);
+		expect("PI_DENY_TOOLS" in third.env).toBe(false);
+	});
+
+	test("a second session start in one runtime keeps the owner", async () => {
+		const run = await generation([OURS]);
+		await run.host.startSession();
+		run.host.messages.length = 0;
+		await run.host.runCommand("t3-subagents-doctor");
+		expect(String(run.host.messages[0]?.content)).toContain("C1 PASS");
+		expect(String(run.host.messages[0]?.content)).toContain("C2 PASS");
 	});
 });

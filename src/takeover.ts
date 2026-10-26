@@ -9,6 +9,13 @@
  *   no foreign `subagent` is registered. If one is (the suppression failed), register
  *   nothing, deactivate pi-subagents' launch tools, and add a notice to the first run.
  * - Always deactivate pi-subagents' `subagent_kill` (and `subagent_resume`, if present).
+ * - Deactivation only hides declarations. Codemode and deferred tools stay callable through
+ *   ctx.executeTool, so a `tool_call` handler also blocks every call (model-issued or
+ *   nested) to those native tools, and to a foreign `subagent` after a failed suppression.
+ *
+ * Copies: each extension runtime (one per session; /reload and session replacement build a
+ * new one after `session_shutdown`) has one owner copy. A copy leaves the process-wide
+ * registry at `session_shutdown`, so the next runtime counts only its own copies.
  *
  * The T3 tool is registered at session start, not at load: a duplicate tool name at load
  * stops Pi 1.4.0 (contract C2), while a check at session start can fail soft (D29).
@@ -28,8 +35,10 @@ const DENIED_AT_LOAD = [LAUNCH_TOOL, RESUME_TOOL];
 /** Shared between copies of this extension in one process (contract C2: one copy only). */
 const COPIES_KEY = Symbol.for("pi-t3-subagents.copies");
 interface CopyRegistry {
-	owner: string;
-	others: Set<string>;
+	/** The copy that changed PI_DENY_TOOLS for the current runtime, if any copy loaded yet. */
+	owner: string | undefined;
+	/** Every copy loaded in the current runtime, in load order. */
+	members: Set<string>;
 }
 
 type Env = Record<string, string | undefined>;
@@ -94,12 +103,18 @@ export function installTakeover(pi: ExtensionAPI, options: TakeoverOptions): Tak
 	}
 
 	const global = globalThis as Record<symbol, CopyRegistry | undefined>;
-	const registry = global[COPIES_KEY] ?? { owner: options.copyId, others: new Set<string>() };
+	const registry: CopyRegistry = global[COPIES_KEY] ?? { owner: undefined, members: new Set<string>() };
 	global[COPIES_KEY] = registry;
-	const copies = () => [registry.owner, ...registry.others];
+	const copies = () => [...registry.members];
+	registry.members.add(options.copyId);
+	registry.owner ??= options.copyId;
+	// Leave the registry when this runtime ends, so a reload counts only the copies it loads.
+	pi.on("session_shutdown", async () => {
+		registry.members.delete(options.copyId);
+		if (registry.owner === options.copyId) registry.owner = undefined;
+	});
 	if (registry.owner !== options.copyId) {
 		// Another copy already changed PI_DENY_TOOLS and owns the session-start work.
-		registry.others.add(options.copyId);
 		const second: TakeoverState = { kind: "second_copy", ownerId: registry.owner };
 		return { state: () => second, copies };
 	}
@@ -122,6 +137,17 @@ export function installTakeover(pi: ExtensionAPI, options: TakeoverOptions): Tak
 	};
 	const hiddenNames = () =>
 		state.kind === "suppression_failed" ? [LAUNCH_TOOL, RESUME_TOOL, KILL_TOOL] : [RESUME_TOOL, KILL_TOOL];
+	// `subagent` is callable only when it is this extension's own tool.
+	const isBlocked = (name: string) => (name === LAUNCH_TOOL ? state.kind !== "registered" : name === RESUME_TOOL || name === KILL_TOOL);
+
+	pi.on("tool_call", async (event) => {
+		if (!isBlocked(event.toolName)) return;
+		const why =
+			state.kind === "suppression_failed"
+				? "delegation is off in this session (a foreign subagent tool was registered; run /t3-subagents-doctor)"
+				: "pi-subagents' children would be invisible to T3; use the T3 subagent tool and T3's task_cancel, t3_thread_send and task_status";
+		return { block: true, reason: `pi-t3-subagents: ${event.toolName} is disabled inside T3 Code: ${why}.` };
+	});
 
 	pi.on("session_start", async () => {
 		if (!restored) {

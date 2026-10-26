@@ -6,7 +6,10 @@
  * relies on (docs/extensions.md, resource-loader.js detectExtensionConflicts):
  * - a tool name registered by two extensions while loading is a fatal load error;
  * - registering a `direct` or `model-only` tool activates it; other exposures stay inactive;
- * - setActiveTools ignores unknown names.
+ * - setActiveTools ignores unknown names;
+ * - a tool call (model-issued, or nested through ctx.executeTool with parentToolCallId)
+ *   runs the `tool_call` handlers first, and a `block` result stops it. A nested call
+ *   reaches active `direct` tools and every `codemode` or `deferred` tool.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -80,6 +83,28 @@ export class FakePiHost {
 	async startRun(prompt = "hello"): Promise<Array<{ customType: string; content: unknown; display?: boolean }>> {
 		const results = await this.emit("before_agent_start", { messageType: "user", prompt, images: [], systemPrompt: "" });
 		return results.flatMap((result: any) => (result?.message ? [result.message] : []));
+	}
+
+	/** End this runtime as Pi does before /reload or a session replacement. */
+	async shutdown(reason = "reload"): Promise<void> {
+		await this.emit("session_shutdown", { reason });
+	}
+
+	/**
+	 * Call a tool as Pi does. Without `parentToolCallId` it is a model call (active tools
+	 * only); with it, a nested ctx.executeTool call. Returns the block reason or the result.
+	 */
+	async callTool(name: string, args: unknown = {}, options: { parentToolCallId?: string } = {}): Promise<{ blocked?: string; result?: any }> {
+		const tool = this.tools.get(name);
+		const reachable = options.parentToolCallId
+			? tool && ((tool.exposure === "direct" && this.active.has(name)) || tool.exposure === "codemode" || tool.exposure === "deferred")
+			: tool && this.active.has(name) && tool.exposure !== "hidden";
+		if (!tool || !reachable) throw new Error(`FakePiHost: tool ${name} is not ${options.parentToolCallId ? "callable" : "active"}`);
+		const toolCallId = options.parentToolCallId ? `${options.parentToolCallId}/1` : "call-1";
+		for (const result of await this.emit("tool_call", { toolName: name, toolCallId, parentToolCallId: options.parentToolCallId, input: args })) {
+			if ((result as any)?.block) return { blocked: String((result as any).reason ?? "blocked") };
+		}
+		return { result: await tool.definition.execute(toolCallId, args, undefined, undefined, this.context()) };
 	}
 
 	async runCommand(name: string, args = "", ctx: { hasUI?: boolean } = {}): Promise<void> {
@@ -159,19 +184,23 @@ function sourceInfo(path: string) {
  * it reads PI_DENY_TOOLS once in its factory, skips denied `subagent` and
  * `subagent_resume`, and registers `subagent_kill` without checking the variable.
  */
-export function fakePiSubagents(env: Record<string, string | undefined>) {
+export function fakePiSubagents(env: Record<string, string | undefined>, exposure?: Exposure) {
 	return (pi: ExtensionAPI) => {
 		const denied = new Set((env.PI_DENY_TOOLS ?? "").split(",").map((name) => name.trim()).filter(Boolean));
 		for (const name of ["subagent", "subagent_resume", "subagent_kill"]) {
 			if (name !== "subagent_kill" && denied.has(name)) continue;
-			pi.registerTool({ name, label: name, description: `pi-subagents ${name}`, parameters: {} } as any);
+			pi.registerTool({ name, label: name, description: `pi-subagents ${name}`, parameters: {}, exposure, execute: executed(name) } as any);
 		}
 	};
 }
 
 /** A pi-subagents version whose suppression fails: it ignores PI_DENY_TOOLS. */
-export function fakeForeignSubagent() {
+export function fakeForeignSubagent(exposure?: Exposure) {
 	return (pi: ExtensionAPI) => {
-		pi.registerTool({ name: "subagent", label: "subagent", description: "foreign subagent", parameters: {} } as any);
+		pi.registerTool({ name: "subagent", label: "subagent", description: "foreign subagent", parameters: {}, exposure, execute: executed("foreign subagent") } as any);
 	};
+}
+
+function executed(label: string) {
+	return async () => ({ content: [{ type: "text", text: `${label} EXECUTED` }], details: undefined });
 }

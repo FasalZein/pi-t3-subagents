@@ -10,7 +10,8 @@ Inside T3 Code the wrapper must replace pi-subagents' `subagent` tool. Pi 1.4.0 
 
 - The suppression depends on pi-subagents internals, not on a Pi API. A change there no longer stops T3 Pi sessions; it disables delegation with a notice, and `/t3-subagents-doctor` names the broken contract.
 - pi-subagents registers `subagent_kill` without checking the variable, so the wrapper cannot take that name (ADR 0003); it deactivates it in T3.
-- Installing this repository a second time (as a settings package as well as through launch arguments) can still load two copies at load time, which is fatal. The README warns against it.
+- Installing this repository a second time (as a settings package as well as through launch arguments) loads two copies. Because the T3 `subagent` is registered at session start, this is not fatal: the first copy owns the takeover, and the doctor's C2 check fails and names both copies. The README warns against it.
+- Deactivating a tool only hides its declaration; codemode and deferred tools stay callable through `ctx.executeTool`. The wrapper therefore also blocks calls to pi-subagents' tools in a `tool_call` handler, on every call path.
 - The fail-soft path needs a real-Pi negative probe before it is trusted (first slice).
 
 ## Considered options
