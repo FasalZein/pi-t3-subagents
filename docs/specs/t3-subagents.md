@@ -143,7 +143,7 @@ Stopping, continuing and reading children use T3's native tools (`task_cancel`, 
 | D19 | Settings write: narrowest window plus post-reload verification; the remaining race with a T3 settings save is documented, not hidden (ADR 0005). |
 | D20 | `async: false`: when T3 stops waiting early, return the live state. A finished child returns its reply inline and says that no wake comes. Batches start all children first; synchronous children are awaited in parallel. |
 | D21 | Continued children count toward width. A slot is reserved before each launch or send. |
-| D22 | Raw `delegate_task` is refused in child threads unless it comes from the wrapper's own launch, and in root threads when it targets a managed instance. Leaves and exhausted budgets lose every bridge tool that starts threads or tasks. |
+| D22 | Raw `delegate_task` is refused in child threads unless it comes from the wrapper's own launch, and in root threads when it targets a managed instance. Leaves and exhausted budgets lose every bridge tool that starts threads or tasks. Owner decision 2026-10-26 (S5): every managed child, at any budget, is refused T3's other bridge tools that start or schedule an agent thread (`create_threads`, `t3_thread_launch`, `t3_thread_fork`, `schedule_task`, `run_scheduled_task_now` and `update_scheduled_task``, each with the `mcp__t3-code__` prefix; list from the installed bridge catalog, T3 Nightly 2026-10-26). Children start threads only through the wrapper's `subagent`. Root threads keep them. |
 | D23 | Launch key = hash of the tool call id, the child index and the request before shell expansion. |
 | D24 | Agent `env` values are set by the child wrapper while it loads; they never enter T3 settings or backups. Variables that Pi reads before any extension loads are a gap. |
 | D25 | Live tests use an authorized namespace `t3e2e-<slice>-` per slice, fixture agents, and a test main instance that loads the slice worktree; teardown deletes the namespace. The `t3` CLI drives runs; the browser is used only for UI checks. |
@@ -295,7 +295,7 @@ Known drift: a wake that never arrives (for example after a Pi process restart, 
 
 - Caller identity: `PI_T3_AGENT` (absent = root). Allowlist, `visible-to` and the self-launch guard as in pi-subagents.
 - Budget: from the header (child), or the agent's own `spawn-depth` when the first message has no header, or 0 when the header cannot be read.
-- Guard: a `tool_call` handler. In a child thread, a `mcp__t3-code__delegate_task` call is allowed only when its `parentToolCallId` is an in-flight call of the wrapper's own `subagent` tool; calls from codemode scripts or from the model are refused. In a root thread, a raw call whose target is a managed instance is refused; other targets pass. In leaves and at budget 0, every thread-starting bridge tool is refused (the launch arguments also exclude them). If Pi stops providing `parentToolCallId`, the guard refuses (fails closed) and the doctor reports it.
+- Guard: a `tool_call` handler. In a child thread, a `mcp__t3-code__delegate_task` call is allowed only when its `parentToolCallId` is an in-flight call of the wrapper's own `subagent` tool; calls from codemode scripts or from the model are refused. In a root thread, a raw call whose target is a managed instance is refused; other targets pass. In every child thread, at any budget, the other bridge tools that start or schedule an agent thread (`create_threads`, `t3_thread_launch`, `t3_thread_fork`, `schedule_task`, `run_scheduled_task_now` and `update_scheduled_task``) are refused, also from codemode and from a call nested in the wrapper's own call; children start threads only through `subagent` (owner decision 2026-10-26). `t3_thread_send` stays available to spawners to continue their children. In leaves and at budget 0, every thread-starting bridge tool is refused (the launch arguments also exclude them). If Pi stops providing `parentToolCallId`, the guard refuses (fails closed) and the doctor reports it.
 - This is a tool policy, not a security sandbox: a child that can edit files can change its own agent definition.
 
 ### Child runtime
@@ -394,7 +394,7 @@ Unverified facts, each closed by a slice acceptance check:
 | U11 | `/t3-sync-agents` appears in the T3 composer, and a slash command sent through `t3 thread start` runs. | S2 |
 | U12 | Failed suppression does not stop Pi: no duplicate, session usable, notice present. | S1 |
 | U13 | Environment set while the extension loads reaches later extensions and bash tools. | S3 |
-| U14 | The guard refuses raw `delegate_task` from a leaf, from a spawning child, and from codemode. | S5 |
+| U14 | The guard refuses raw `delegate_task` from a leaf, from a spawning child, and from codemode; and, in every child, `create_threads` and `t3_thread_launch` (owner decision 2026-10-26). | S5 |
 | U15 | Two concurrent `wait` launches from one tool call run in parallel in T3. | S4 |
 | U16 | The `t3 thread` CLI drives parent turns on a test main instance. | S2 |
 | U17 | A launch right after a sync runs the new revision or returns the stale reply; never the old configuration silently. | S3 |
@@ -497,7 +497,7 @@ Delivers: caller identity, allowlist, visibility, self-launch guard, the exact b
 - [ ] Layer 1: the caller's `spawning` list, the target's `visible-to` and the self-launch guard each refuse with a clear error.
 - [ ] Layer 1 guard: in a child, raw `delegate_task` from the model and from a codemode script is refused, and the wrapper's own nested call passes; in root, a raw call to a managed instance is refused and a call to a non-managed instance passes; without `parentToolCallId` the guard refuses.
 - [ ] Layer 2: an instance with a fixed tool list that may spawn has `subagent` and the named bridge tools active (U2); a leaf has neither.
-- [ ] Live (`t3e2e-s5-`): a spawning fixture child launches a leaf grandchild; the grandchild's wake reaches the child thread and the child's wake reaches root; a spawning fixture launched with budget 1 cannot launch; raw `delegate_task` attempts from a leaf, a spawning child and codemode are refused (U14).
+- [ ] Live (`t3e2e-s5-`): a spawning fixture child launches a leaf grandchild; the grandchild's wake reaches the child thread and the child's wake reaches root; a spawning fixture launched with budget 1 cannot launch; raw `delegate_task` attempts from a leaf, a spawning child and codemode are refused (U14); a spawning child's `create_threads` and `t3_thread_launch` are refused (owner decision 2026-10-26).
 
 ### S6: Caller ping and lifecycle guidance
 
