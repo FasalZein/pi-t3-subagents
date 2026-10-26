@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createExtension } from "../../index.ts";
 import type { ChildRuntime, ChildState } from "../../src/child-runtime.ts";
-import { EXHAUSTED_TOOLS, installChildTools } from "../../src/child-tools.ts";
+import { EXHAUSTED_TOOLS, installChildTools, withoutExhaustedTools } from "../../src/child-tools.ts";
 import type { Caller } from "../../src/launch-planner.ts";
 import { THREAD_STARTING_TOOLS } from "../../src/planner.ts";
 import { guardCheck, installRawDelegationGuard } from "../../src/raw-delegation-guard.ts";
@@ -230,6 +230,21 @@ describe("budget-0 tool exposure (child-tools)", () => {
 		expect(host.active.has(DELEGATE)).toBe(true); // the bridge re-added it in before_agent_start
 		await host.emit("turn_start", {});
 		expect([...host.active].sort()).toEqual(["read"]);
+	});
+
+	test("budget 0: the provider request loses the spawn tool declarations (Anthropic and Chat Completions shapes)", async () => {
+		const host = await child(0);
+		await host.startSession();
+		const payload = { model: "m", tools: [{ name: "read" }, { name: DELEGATE }, { type: "function", function: { name: SEND } }, { name: "subagent" }] };
+		const [replaced] = await host.emit("before_provider_request", { payload });
+		expect(replaced).toEqual({ model: "m", tools: [{ name: "read" }] });
+		expect(withoutExhaustedTools({ tools: [{ name: "read" }] })).toEqual({ tools: [{ name: "read" }] });
+	});
+
+	test("budget above 0: the provider request is unchanged", async () => {
+		const host = await child(1);
+		const [replaced] = await host.emit("before_provider_request", { payload: { tools: [{ name: DELEGATE }] } });
+		expect(replaced).toBeUndefined();
 	});
 
 	test("budget above 0: the spawn tools stay active", async () => {
