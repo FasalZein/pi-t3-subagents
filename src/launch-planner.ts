@@ -418,18 +418,41 @@ export function launchItem(prepared: Pick<PreparedLaunch, "name" | "agent">, lau
 	};
 }
 
-export function itemText(item: LaunchItem): string {
+/**
+ * Owner decision (S8): for an interactive or asking child, the user answers in the child thread;
+ * the parent does not ask again or relay, and ends its turn.
+ */
+export const ANSWER_IN_CHILD =
+	"The user answers in the child thread. Do not ask the question again and do not relay it; end your turn. The child's final reply wakes this thread.";
+
+/** Lifecycle tools: the public bridge name, and the codemode spelling of that same tool. */
+const LIFECYCLE = {
+	cancel: ["mcp__t3-code__task_cancel", "tools.mcp__t3_code__task_cancel"],
+	send: ["mcp__t3-code__t3_thread_send", "tools.mcp__t3_code__t3_thread_send"],
+	status: ["mcp__t3-code__task_status", "tools.mcp__t3_code__task_status"],
+} as const;
+
+export function itemText(item: LaunchItem, options: { interactive?: boolean } = {}): string {
 	const head = `${item.name} (${item.agent}): taskId=${item.taskId} childThreadId=${item.childThreadId} instance=${item.providerInstanceId} model=${item.model} status=${item.status} state=${item.state}`;
 	const body: Record<LaunchState, string> = {
-		running: "The child runs in its own T3 thread. Completion wakes this thread; end your turn now.",
+		running: options.interactive
+			? `The child runs in its own T3 thread, where the user can reply to it. ${ANSWER_IN_CHILD}`
+			: "The child runs in its own T3 thread. Completion wakes this thread; end your turn now.",
 		finished: `The child already finished [${item.status}]; no wake will come. Its reply:\n${item.summary ?? "(no reply text)"}`,
-		waiting: "The child waits for input in its thread (question or approval). A wake may follow when it settles (unverified, U19).",
+		// U19 (live S4): a completion wake follows a wait that ended on a question.
+		waiting: `The child waits for input in its thread (question or approval). ${ANSWER_IN_CHILD}`,
 		wait_timed_out: "The wait reached its limit. The child still runs; a wake comes when it finishes.",
 	};
+	const args = {
+		cancel: JSON.stringify({ taskId: item.taskId }),
+		send: JSON.stringify({ threadId: item.childThreadId, message: "..." }),
+		status: JSON.stringify({ taskId: item.taskId }),
+	};
+	const call = (tool: keyof typeof LIFECYCLE) => `${LIFECYCLE[tool][0]} ${args[tool]} (codemode: ${LIFECYCLE[tool][1]}(${args[tool]}))`;
 	const lifecycle = [
-		`Stop: task_cancel {"taskId":"${item.taskId}"}.`,
-		`Continue a finished child: t3_thread_send {"threadId":"${item.childThreadId}","message":"..."}.`,
-		`Read: task_status {"taskId":"${item.taskId}"} marks the result read and suppresses the wake.`,
+		`Stop: ${call("cancel")}.`,
+		`Continue a finished child: ${call("send")}.`,
+		`Read: ${call("status")} marks the result read and suppresses the wake.`,
 	];
 	return [head, body[item.state], ...lifecycle].join("\n");
 }

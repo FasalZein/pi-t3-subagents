@@ -33,6 +33,8 @@ import { installTakeover, isInsideT3, takeoverChecks } from "./src/takeover.ts";
 import { installManagedChildTools } from "./src/managed-child-tools.ts";
 import { guardCheck, installRawDelegationGuard } from "./src/raw-delegation-guard.ts";
 import { installChildTools } from "./src/child-tools.ts";
+import { installLedger, wakeFormatCheck } from "./src/ledger.ts";
+import { ledgerOf } from "./src/subagent-tool.ts";
 
 type Env = Record<string, string | undefined>;
 
@@ -66,6 +68,8 @@ export function createExtension(env: Env = process.env, copyId: string = import.
 		}
 		// [slot S5] end
 		// [slot S4] batches, synchronous calls, width ledger (C5): begin
+		if (insideT3) installLedger(pi as any, ledgerOf(tool));
+		doctor.register(wakeFormatCheck(ledgerOf(tool)));
 		// [slot S4] end
 		// Managed-child tools and child-run handlers: only in a managed child, only in the copy
 		// that owns the takeover, so a second copy cannot register a duplicate tool or a second timer.

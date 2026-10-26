@@ -57,11 +57,11 @@ async function boot(extra: Array<[string, (pi: any) => void]> = [], copies: stri
 }
 
 describe("doctor inside T3", () => {
-	test("healthy session: C1, C2, C3, C4, C6, C7 and C8 pass", async () => {
+	test("healthy session: C1 to C8 pass", async () => {
 		const host = await boot();
 		addBridge(host);
 		const lines = await doctorLines(host);
-		expect([...lines.keys()]).toEqual(["C1", "C2", "C3", "C4", "C6", "C7", "C8"]);
+		expect([...lines.keys()]).toEqual(["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8"]);
 		for (const line of lines.values()) expect(line).toContain(" PASS ");
 	});
 

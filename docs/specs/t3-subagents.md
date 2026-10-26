@@ -154,6 +154,7 @@ Stopping, continuing and reading children use T3's native tools (`task_cancel`, 
 | D30 | The wrapper injects its own agent roster. |
 | D31 | Update safety: never edit T3, Pi or pi-subagents install files; write only owned settings entries; startup checks plus `/t3-subagents-doctor`. |
 | D32 | Broken accounting (an unreadable wake) fails open with a notice. Safety rules do not depend on T3 text and stay enforced. |
+| D34 | Ledger ordering prefers freeing slots (owner decision 2026-10-26, S4 final review). Any terminal observation of a child thread (a terminal `t3_thread_read`, a final `task_status`, a wake, a `task_cancel` result) ends every live task of that thread and every `t3_thread_send` to it that still waits for its response, whatever the arrival order. A later non-final response may make a task live only when it names a task id the ledger has not seen closed. Accepted risk: width can be briefly undercounted, so one extra child may start; a slot is never stuck. Like D32, this is accounting, not a safety rule. |
 | D33 | Slice graph for parallel workers (see "Delivery Slices"). Build: one worker per slice, model cpa/claude-opus-5-5. |
 | Seams | One main test seam (fake Pi host plus fake T3 bridge), real Pi probes, live T3 e2e. |
 
@@ -273,7 +274,7 @@ Mode hints in T3:
 
 ### Live-children ledger
 
-All transitions are idempotent and keyed by task id or reservation id.
+All transitions are idempotent and keyed by task id or reservation id. A task id seen closed stays closed. Reservations for launches belong to the launch key: concurrent exact retries share one slot, which is freed only when the last attempt ends without a launch.
 
 | Event | Effect |
 |---|---|
@@ -281,15 +282,15 @@ All transitions are idempotent and keyed by task id or reservation id.
 | Launch response with a non-final status | Reservation becomes live task. |
 | Launch response with a final status | Release the reservation. |
 | Launch error | Release the reservation. |
-| Raw input contains a wake for a live task | Remove the task. A wake can carry several tasks, in the full or the short `task_status` form. |
-| `task_cancel` result for a live task (any status) | Remove the task. |
-| `task_status` or `t3_thread_read` result with a final status for a live task | Remove the task. Observing a call that the model made is not polling. |
+| Raw input contains a wake for a live task | Close the task and its thread (D34). A wake can carry several tasks, in the full or the short `task_status` form. Question notices ("is blocked on a question", "asked a question and is still working") keep the task live. |
+| `task_cancel` result for a live task (any status) | Close the task and its thread (D34). |
+| `task_status` result with a final status, or `t3_thread_read` result with a final thread status | Close the task and its thread (D34): every live task of the thread and every pending `t3_thread_send` to it. Observing a call that the model made is not polling. |
 | `t3_thread_send` call to a known child thread | Reserve one slot, or block the call when the width is full. |
 | `t3_thread_send` result with a new task id | Reservation becomes live task. |
 | `t3_thread_send` result without a task id, or an error | Release the reservation. |
 | Raw input that looks like a wake but cannot be read | Stop width enforcement for this session and add a notice (D32). |
 
-Known drift: a wake that never arrives (for example after a Pi process restart, or a user stop if U9 shows no wake) leaves a task live until the process restarts.
+Known drift: D34 can undercount width for a moment (a terminal read of a thread also ends a continuation that started during the read), so one extra child may start. A wake that never arrives (for example after a Pi process restart, or a user stop if U9 shows no wake) leaves a task live until the process restarts.
 
 ### Spawn policy and raw-delegation guard
 
