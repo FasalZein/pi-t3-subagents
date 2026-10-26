@@ -154,6 +154,26 @@ test("fail closed: agent frontmatter that cannot be identified for removal stops
 	expect(results).toContainEqual({ systemPrompt: "" });
 });
 
+const fenced = (name: string) => "\n\nExample agent file:\n\n```markdown\n---\nname: " + name + "\nmodel: cpa/x\n---\nExample body\n```\n";
+
+test("a fenced frontmatter example in the body that names another agent is kept and the run continues", async () => {
+	const { host } = await child("fx-env");
+	const snapshot = "---\nname: fx-env\nenv: |\n  FX_OLD_SECRET=synthetic-old-value\n---\n\n# fx-env body" + fenced("example-agent");
+	const systemPromptOptions: any = { cwd: "/tmp", customPrompt: snapshot, sections: {} };
+	const { calls } = await runStart(host, systemPromptOptions);
+	expect(calls.abort).toBe(0);
+	expect(systemPromptOptions.customPrompt).toBe("# fx-env body" + fenced("example-agent"));
+});
+
+test("a fenced frontmatter example in the body that names this agent is kept verbatim", async () => {
+	const { host } = await child("fx-env");
+	const snapshot = "---\nname: fx-env\n---\n\n# fx-env body" + fenced("fx-env");
+	const systemPromptOptions: any = { cwd: "/tmp", customPrompt: snapshot, sections: {} };
+	const { calls } = await runStart(host, systemPromptOptions);
+	expect(calls.abort).toBe(0);
+	expect(systemPromptOptions.customPrompt).toBe("# fx-env body" + fenced("fx-env"));
+});
+
 test("fail closed: an agent file read failure while preparing the prompt stops the run", async () => {
 	const { host } = await child("fx-spawner"); // append + inherit-append-system reads the file each run.
 	rmSync(join(h.agentsDir, "fx-spawner.md"));

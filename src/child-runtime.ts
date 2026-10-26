@@ -45,25 +45,22 @@ export function restoredState(data: unknown, agent: string, instanceId: string):
 	return { agent, instanceId, budget: d.budget, caller: d.caller, expectedRevision: d.expectedRevision, source: d.source, stale: d.stale };
 }
 
-const BLOCK = /(^|\n)[ \t]*---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?=\r?\n|$)/g;
-/** Keys that mark a block as agent-definition frontmatter (pi-subagents field names). */
-const AGENT_KEYS = /^(name|description|env|model|thinking|tools|system-prompt|extensions|skills|spawning)[ \t]*:/m;
+/** The leading frontmatter block of an agent file (same shape as the catalog's parser). */
+const LEADING_BLOCK = /^---\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/;
 
 /**
- * Remove the agent file's frontmatter from the prompt section that Pi built from it.
- * The section is Pi's snapshot from load time, so it may differ from the current file:
- * a block is removed when it leads the section or names this agent. `proven` is false
- * when a block with agent-definition keys remains (the caller then stops the run).
+ * Remove the agent file's frontmatter from the prompt section that Pi built from that file.
+ * The section is Pi's snapshot from load time, so it may differ from the current file;
+ * it starts with the file's own frontmatter block. Exactly that one leading block is
+ * removed and the body is kept verbatim (leading blank lines aside), so fenced examples
+ * in the body stay. `proven` is false when the section does not start with a
+ * frontmatter block: the source cannot be identified, and the caller stops the run.
  */
-export function stripAgentFrontmatter(section: string, agentName: string): { text: string; proven: boolean } {
-	const lead = section.length - section.trimStart().length;
-	const named = new RegExp(`^name[ \\t]*:[ \\t]*${agentName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[ \\t]*$`, "m");
-	let text = section.replace(BLOCK, (block, sep: string, body: string, offset: number) =>
-		offset <= lead || named.test(body) ? sep : block,
-	);
-	text = text.replace(/^\s+/, "");
-	const leftover = [...text.matchAll(BLOCK)].some((m) => AGENT_KEYS.test(m[2]));
-	return { text, proven: !leftover };
+export function stripAgentFrontmatter(section: string): { text: string; proven: boolean } {
+	const trimmed = section.replace(/^\s+/, "");
+	const block = trimmed.match(LEADING_BLOCK)?.[0];
+	if (!block) return { text: section, proven: false };
+	return { text: trimmed.slice(block.length).replace(/^\s+/, ""), proven: true };
 }
 
 export type HeaderSource = "header" | "missing" | "unreadable";
@@ -197,8 +194,8 @@ export function installChildRuntime(pi: ExtensionAPI, env: Env): ChildRuntime | 
 			const key = mode === "replace" ? "customPrompt" : mode === "append" && agent.fields["inherit-append-system"] !== "true" ? "appendSystemPrompt" : undefined;
 			const value = key ? options[key] : undefined;
 			if (key && typeof value === "string") {
-				const stripped = stripAgentFrontmatter(value, agentName);
-				if (!stripped.proven) return stop(`the ${key} section still holds agent frontmatter after the strip`);
+				const stripped = stripAgentFrontmatter(value);
+				if (!stripped.proven) return stop(`the ${key} section does not start with the agent file's frontmatter`);
 				options[key] = stripped.text;
 			}
 			if (mode === "append" && agent.fields["inherit-append-system"] === "true") {
