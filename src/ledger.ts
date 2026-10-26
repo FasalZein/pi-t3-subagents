@@ -109,8 +109,11 @@ export class Ledger {
 	private readonly live = new Map<string, LiveTask>();
 	/** Open reservations: id -> the launch key it serves (sends have none). */
 	private readonly reservations = new Map<string, string | undefined>();
-	/** Launch key -> its open reservation (a concurrent exact retry shares it). */
-	private readonly keyReservations = new Map<string, string>();
+	/**
+	 * Launch key -> its open reservation and the number of attempts that hold it. Concurrent exact
+	 * retries share it; it is released only when the last holder ends without a launch.
+	 */
+	private readonly keyReservations = new Map<string, { id: string; holders: number }>();
 	/** Launch keys that reached T3: an exact retry gets T3's replay, never a new child (D23). */
 	private readonly launchedKeys = new Set<string>();
 	/**
@@ -124,6 +127,11 @@ export class Ledger {
 	private readonly sends = new Map<string, string>();
 	/** t3_thread_read tool call id -> the live tasks of that thread when the read started. */
 	private readonly reads = new Map<string, string[]>();
+	/**
+	 * Run ids that a t3_thread_read reported terminal. A send response that names such a run
+	 * arrived after the read already acknowledged its result: no wake comes, the task is ended.
+	 */
+	private readonly endedRuns = new Set<string>();
 	private nextId = 1;
 	private failOpen: string | null = null;
 
@@ -146,7 +154,7 @@ export class Ledger {
 	private open(key?: string): string {
 		const id = `r${this.nextId++}`;
 		this.reservations.set(id, key);
-		if (key !== undefined) this.keyReservations.set(key, id);
+		if (key !== undefined) this.keyReservations.set(key, { id, holders: 1 });
 		return id;
 	}
 
@@ -160,27 +168,34 @@ export class Ledger {
 	}
 
 	/**
-	 * Reserve one slot per launch key, synchronously, for the keys that need one. A key that already
-	 * reached T3, or has an open reservation, needs none: T3 replays it without a new child (D23).
-	 * Returns the keys this call reserved; throws when they do not fit.
+	 * Hold one slot per launch key, synchronously. A key that already reached T3 needs none: T3
+	 * replays it without a new child (D23). A key with an open reservation (an exact retry in
+	 * flight) shares it. Returns the keys this attempt holds; each must end with settleLaunch or
+	 * dropLaunch. Throws when the new slots do not fit.
 	 */
 	reserveLaunches(keys: readonly string[]): string[] {
-		const fresh = [...new Set(keys)].filter((key) => !this.launchedKeys.has(key) && !this.keyReservations.has(key));
+		const unique = [...new Set(keys)].filter((key) => !this.launchedKeys.has(key));
+		const fresh = unique.filter((key) => !this.keyReservations.has(key));
 		this.check(fresh.length);
-		for (const key of fresh) this.open(key);
-		return fresh;
+		for (const key of unique) {
+			const held = this.keyReservations.get(key);
+			if (held) held.holders++;
+			else this.open(key);
+		}
+		return unique;
+	}
+
+	/** One attempt for `key` ended without a launch: the slot is freed when no other attempt holds it. */
+	dropLaunch(key: string): void {
+		const held = this.keyReservations.get(key);
+		if (!held || --held.holders > 0) return;
+		this.release(held.id);
 	}
 
 	release(reservation: string): void {
 		const key = this.reservations.get(reservation);
 		if (!this.reservations.delete(reservation)) return;
-		if (key !== undefined && this.keyReservations.get(key) === reservation) this.keyReservations.delete(key);
-	}
-
-	/** Release the open reservation of a launch key (the launch did not reach T3). */
-	releaseLaunch(key: string): void {
-		const reservation = this.keyReservations.get(key);
-		if (reservation !== undefined) this.release(reservation);
+		if (key !== undefined && this.keyReservations.get(key)?.id === reservation) this.keyReservations.delete(key);
 	}
 
 	/** A task observed terminal: never live again. */
@@ -189,22 +204,23 @@ export class Ledger {
 		this.ended.add(taskId);
 	}
 
-	private record(task: { taskId: string; childThreadId: string; status: string }): void {
+	private record(task: { taskId: string; childThreadId: string; status: string; runId?: string }): void {
 		this.threads.add(task.childThreadId);
-		if (FINAL_TASK_STATUSES.has(task.status)) this.end(task.taskId);
+		if (FINAL_TASK_STATUSES.has(task.status) || (task.runId !== undefined && this.endedRuns.has(task.runId))) this.end(task.taskId);
 		else if (!this.ended.has(task.taskId)) this.live.set(task.taskId, { taskId: task.taskId, childThreadId: task.childThreadId });
 	}
 
 	/** A send response: a non-final status makes the reservation a live task; a final one releases it. */
-	settle(reservation: string, task: { taskId: string; childThreadId: string; status: string }): void {
+	settle(reservation: string, task: { taskId: string; childThreadId: string; status: string; runId?: string }): void {
 		if (!this.reservations.has(reservation)) return;
 		this.release(reservation);
 		this.record(task);
 	}
 
-	/** A launch response for `key` (also an exact retry's replay): the task is live unless terminal. */
+	/** A launch response for `key` (also an exact retry's replay): the slot becomes the task, live unless terminal. */
 	settleLaunch(key: string, task: { taskId: string; childThreadId: string; status: string }): void {
-		this.releaseLaunch(key);
+		const held = this.keyReservations.get(key);
+		if (held) this.release(held.id);
 		this.launchedKeys.add(key);
 		this.record(task);
 	}
@@ -271,7 +287,13 @@ export class Ledger {
 				if (reservation === undefined) return;
 				this.sends.delete(event.toolCallId);
 				const threadId = String(data?.threadId ?? event.input?.threadId);
-				if (data?.isError !== true && typeof data?.taskId === "string") this.settle(reservation, { taskId: data.taskId, childThreadId: threadId, status: String(data.status ?? "running") });
+				if (data?.isError !== true && typeof data?.taskId === "string")
+					this.settle(reservation, {
+						taskId: data.taskId,
+						childThreadId: threadId,
+						status: String(data.status ?? "running"),
+						...(typeof data.runId === "string" ? { runId: data.runId } : {}),
+					});
 				else this.release(reservation);
 				return;
 			}
@@ -291,6 +313,7 @@ export class Ledger {
 				// the tasks live when the read started: a continuation sent meanwhile is a newer run.
 				const seen = this.reads.get(event.toolCallId) ?? [];
 				this.reads.delete(event.toolCallId);
+				for (const runId of terminalRuns(data)) this.endedRuns.add(runId);
 				const status = data?.status ?? data?.thread?.status;
 				if (!FINAL_TASK_STATUSES.has(String(status))) return;
 				for (const taskId of seen) this.end(taskId);
@@ -298,6 +321,16 @@ export class Ledger {
 			}
 		}
 	}
+}
+
+/** Run ids a t3_thread_read result reports terminal: recent runs, and the latest run of a final thread. */
+function terminalRuns(data: any): string[] {
+	const runs: string[] = [];
+	for (const run of [...(Array.isArray(data?.recentRuns) ? data.recentRuns : []), ...(Array.isArray(data?.runs) ? data.runs : [])])
+		if (typeof run?.runId === "string" && FINAL_TASK_STATUSES.has(String(run.status))) runs.push(run.runId);
+	const thread = data?.thread ?? data;
+	if (typeof thread?.latestRunId === "string" && FINAL_TASK_STATUSES.has(String(thread.status))) runs.push(thread.latestRunId);
+	return runs;
 }
 
 /**

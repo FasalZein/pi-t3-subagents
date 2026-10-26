@@ -470,3 +470,107 @@ test("owner decision (S8): interactive and asking children tell the parent that 
 	expect(blocks[1]).toContain(ANSWER); // synchronous, waiting on a question
 	expect(blocks[2]).not.toContain(ANSWER); // background leaf
 });
+
+// --- Re-review fixes (a0e9012): ordering across attempts and observations.
+
+test("re-review A: a failed attempt keeps the slot of an exact retry still in flight; a competing launch is refused", async () => {
+	const ledger = width(1);
+	const tool = toolWith(ledger);
+	let firstEntered!: () => void;
+	let secondEntered!: () => void;
+	let rejectFirst!: (e: Error) => void;
+	let releaseSecond!: () => void;
+	const inFirst = new Promise<void>((r) => (firstEntered = r));
+	const inSecond = new Promise<void>((r) => (secondEntered = r));
+	const gateSecond = new Promise<void>((r) => (releaseSecond = r));
+	let originalCalls = 0;
+	const bridge = bridgeFor(async (a) => {
+		if (a.title === "Title fx-c1") {
+			if (++originalCalls === 1) {
+				firstEntered();
+				return await new Promise((_resolve, reject) => (rejectFirst = reject));
+			}
+			secondEntered();
+			await gateSecond;
+			return delegateResult(1);
+		}
+		return delegateResult(2);
+	});
+	const params = child("fx-c1");
+	const first = f.run(tool, bridge, params, "same-call").catch((e) => e);
+	await inFirst;
+	const retry = f.run(tool, bridge, params, "same-call");
+	await inSecond;
+	rejectFirst(new Error("transport failed for first attempt"));
+	expect((await first).message).toContain("transport failed");
+	expect(ledger.snapshot()).toMatchObject({ live: [], reserved: 1 });
+	await expect(f.run(tool, bridge, child("fx-c2"), "other-call")).rejects.toThrow(/spawn width is full/);
+	releaseSecond();
+	await retry;
+	expect(ledger.snapshot()).toMatchObject({ reserved: 0, live: [{ taskId: "task-1" }] });
+});
+
+test("re-review A: when every attempt for a key fails, its slot is freed once", async () => {
+	const ledger = width(1);
+	const tool = toolWith(ledger);
+	const bridge = new FakeBridge().fail(DELEGATE, "provider_unavailable");
+	const params = child("fx-c1");
+	await Promise.allSettled([f.run(tool, bridge, params, "same-call"), f.run(tool, bridge, params, "same-call")]);
+	expect(ledger.snapshot()).toMatchObject({ live: [], reserved: 0 });
+	const ok = bridgeFor(() => delegateResult(2));
+	await f.run(tool, ok, child("fx-c2"), "other-call");
+	expect(liveIds(ledger)).toEqual(["task-2"]);
+});
+
+test("re-review B: a terminal read of the continuation's run before its send response keeps that task ended", async () => {
+	const ledger = width(1);
+	const [old] = ledger.reserve(1);
+	ledger.settle(old!, { taskId: "old-task", childThreadId: "child", status: "completed" });
+	let entered!: () => void;
+	let release!: () => void;
+	const inSend = new Promise<void>((r) => (entered = r));
+	const gate = new Promise<void>((r) => (release = r));
+	const bridge = new FakeBridge()
+		.respond(THREAD_SEND, async () => {
+			entered();
+			await gate;
+			return { threadId: "child", taskId: "new-task", runId: "new-run", status: "running", delivery: "started" };
+		})
+		.respond(THREAD_READ, () => ({
+			thread: { threadId: "child", status: "completed", latestRunId: "new-run" },
+			recentRuns: [{ runId: "new-run", status: "completed" }],
+			items: [{ type: "assistant_message", runId: "new-run", text: "DONE" }],
+		}));
+	const host = await ledgerHost(ledger, bridge);
+	const sending = call(host, THREAD_SEND, { threadId: "child", message: "continue" });
+	await inSend;
+	await call(host, THREAD_READ, { threadId: "child" });
+	release();
+	await sending;
+	expect(ledger.snapshot()).toMatchObject({ live: [], reserved: 0 });
+	expect(ledger.reserve(1)).toHaveLength(1);
+});
+
+test("re-review B: a terminal read of an older run does not end a newer continuation run", async () => {
+	const ledger = width(2);
+	const [old] = ledger.reserve(1);
+	ledger.settle(old!, { taskId: "old-task", childThreadId: "child", status: "completed" });
+	let entered!: () => void;
+	let release!: () => void;
+	const inSend = new Promise<void>((r) => (entered = r));
+	const gate = new Promise<void>((r) => (release = r));
+	const bridge = new FakeBridge()
+		.respond(THREAD_SEND, async () => {
+			entered();
+			await gate;
+			return { threadId: "child", taskId: "new-task", runId: "new-run", status: "running", delivery: "started" };
+		})
+		.respond(THREAD_READ, () => ({ thread: { threadId: "child", status: "completed", latestRunId: "old-run" }, recentRuns: [{ runId: "old-run", status: "completed" }], items: [] }));
+	const host = await ledgerHost(ledger, bridge);
+	const sending = call(host, THREAD_SEND, { threadId: "child", message: "continue" });
+	await inSend;
+	await call(host, THREAD_READ, { threadId: "child" });
+	release();
+	await sending;
+	expect(liveIds(ledger)).toEqual(["new-task"]);
+});

@@ -231,7 +231,11 @@ export function createSubagentTool(deps: SubagentToolDeps): ToolDefinition<typeo
 		reachesTools: () => ["delegate_task"],
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const at = new Date().toISOString();
-			let reserved: string[] = [];
+			// Launch keys this attempt holds a slot for; each ends with settleLaunch or dropLaunch once.
+			const held = new Set<string>();
+			const drop = (key: string) => {
+				if (held.delete(key)) ledger.dropLaunch(key);
+			};
 			try {
 				const batch = params.children !== undefined && params.children.length > 0;
 				if (batch && (params.task !== undefined || params.agent !== undefined))
@@ -241,7 +245,7 @@ export function createSubagentTool(deps: SubagentToolDeps): ToolDefinition<typeo
 				// Step 2: reserve the whole batch before the first await, so parallel calls cannot exceed
 				// the width. An exact retry of a launched key reserves nothing: T3 replays that child.
 				try {
-					reserved = ledger.reserveLaunches(keys);
+					for (const key of ledger.reserveLaunches(keys)) held.add(key);
 				} catch (error) {
 					throw new LaunchError(`subagent launch refused: ${(error as Error).message}`);
 				}
@@ -262,6 +266,7 @@ export function createSubagentTool(deps: SubagentToolDeps): ToolDefinition<typeo
 				const start = (index: number) =>
 					startLaunch(launches[index]!, send).then((item) => {
 						items[index] = item;
+						held.delete(keys[index]!);
 						ledger.settleLaunch(keys[index]!, { taskId: item.taskId, childThreadId: item.childThreadId, status: item.status });
 					});
 				// Step 5: array order; async children are awaited one by one, synchronous ones run concurrently.
@@ -278,7 +283,7 @@ export function createSubagentTool(deps: SubagentToolDeps): ToolDefinition<typeo
 				}
 				await Promise.all(waits);
 				// Step 6: reservations of children that did not start are released.
-				for (let index = 0; index < launches.length; index++) if (!items[index] && reserved.includes(keys[index]!)) ledger.releaseLaunch(keys[index]!);
+				for (let index = 0; index < launches.length; index++) if (!items[index]) drop(keys[index]!);
 				if (failure) {
 					if (failure.error instanceof LaunchError && /^delegate_task failed/.test(failure.error.message)) bridgeFailed = true;
 					throw Object.assign(new LaunchError(batchError(launches, items, failure)), { bridge: bridgeFailed });
@@ -294,7 +299,7 @@ export function createSubagentTool(deps: SubagentToolDeps): ToolDefinition<typeo
 				};
 			} catch (error) {
 				// A refusal before the bridge releases every reservation (idempotent after step 6).
-				for (const key of reserved) ledger.releaseLaunch(key);
+				for (const key of [...held]) drop(key);
 				deps.onOutcome?.({ ok: false, at, error: (error as Error).message, bridge: (error as any).bridge === true });
 				throw error;
 			}
