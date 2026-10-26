@@ -25,28 +25,49 @@ export const THREAD_SEND = `${BRIDGE}t3_thread_send`;
 export const FAIL_OPEN_NOTICE =
 	"pi-t3-subagents: a T3 completion wake could not be read (wake text format changed, C5). Spawn-width accounting is off for this session; launches are no longer limited by width. Run /t3-subagents-doctor.";
 
-/** One wake block: `Delegated task <id> (<title>) [<status>]:` (full), the task_status short form, or the not-found form. */
+/*
+ * T3 wake and notice lines (installed Nightly bundle, 2026-10-26):
+ * - `Delegated task <id> (<title>) [<status>]:` plus the reply (full form; the title is optional),
+ * - `Delegated task <id> (<title>) [<status>]. Use task_status with taskId <id> to read the result.` (short form),
+ * - `Delegated task <id> reached a terminal state` (task not found), and ProviderContinuationService's
+ *   `Delegated task <id> reached a terminal state. Use task_status ...` / `Delegated tasks <a>, <b> reached terminal states. ...`,
+ * - question notices (live S4 run, U19): `Delegated task <id> is blocked on a question and cannot continue until it is
+ *   answered.` and `Delegated task <id> asked a question and is still working.` The task stays live.
+ */
 const WAKE_LINE = /^Delegated task (\S+)(?: \(.*\))? \[([A-Za-z_]+)\](?::|\. Use task_status with taskId \S+ to read the result\.)/;
-const WAKE_NOT_FOUND = /^Delegated task (\S+) reached a terminal state/;
-const WAKE_LIKE = /(?:^|\n)\s*Delegated task /;
+const WAKE_NOT_FOUND = /^Delegated task (\S+)(?: \(.*\))? reached a terminal state/;
+const WAKE_MANY = /^Delegated tasks (.+?) reached terminal states/;
+const QUESTION_NOTICE = /^Delegated task (\S+) (?:is blocked on a question|asked a question and is still working)/;
+const WAKE_LIKE = /(?:^|\n)\s*Delegated tasks? /;
 
 export interface WakeParse {
-	/** Text looks like a T3 completion wake. */
+	/** Text looks like a T3 completion wake or task notice. */
 	readonly wake: boolean;
-	/** Task ids the wake reports as settled (empty when the wake is unreadable). */
+	/** Task ids the wake reports as settled. */
 	readonly taskIds: readonly string[];
+	/** Task ids named by a question notice (still live). */
+	readonly noticeIds: readonly string[];
 }
 
 /** Parse T3's wake text (T3 facts, wake text). Several tasks are joined with a blank line. */
 export function parseWake(text: string): WakeParse {
-	if (!WAKE_LIKE.test(text)) return { wake: false, taskIds: [] };
+	if (!WAKE_LIKE.test(text)) return { wake: false, taskIds: [], noticeIds: [] };
 	const taskIds: string[] = [];
+	const noticeIds: string[] = [];
+	const add = (list: string[], id: string) => void (list.includes(id) || list.push(id));
 	for (const raw of text.split("\n")) {
 		const line = raw.trim();
+		const notice = QUESTION_NOTICE.exec(line);
+		if (notice) {
+			add(noticeIds, notice[1]!);
+			continue;
+		}
 		const match = WAKE_LINE.exec(line) ?? WAKE_NOT_FOUND.exec(line);
-		if (match && !taskIds.includes(match[1]!)) taskIds.push(match[1]!);
+		if (match) add(taskIds, match[1]!);
+		const many = WAKE_MANY.exec(line);
+		if (many) for (const id of many[1]!.split(/,\s*/)) if (id.trim()) add(taskIds, id.trim());
 	}
-	return { wake: true, taskIds };
+	return { wake: true, taskIds, noticeIds };
 }
 
 export class WidthFullError extends Error {
@@ -143,7 +164,7 @@ export class Ledger {
 	observeInput(text: string): string | undefined {
 		const parsed = parseWake(text);
 		if (!parsed.wake) return undefined;
-		if (parsed.taskIds.length === 0) {
+		if (parsed.taskIds.length === 0 && parsed.noticeIds.length === 0) {
 			if (this.failOpen !== null) return undefined;
 			this.failOpen = `unreadable wake at ${new Date().toISOString()}: ${JSON.stringify(text.slice(0, 120))}`;
 			return FAIL_OPEN_NOTICE;

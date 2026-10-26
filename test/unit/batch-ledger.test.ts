@@ -202,8 +202,27 @@ test("wake parse: full form with several tasks, short form and not-found form", 
 		"Delegated task t3 (Long one) [completed]. Use task_status with taskId t3 to read the result.",
 		"Delegated task t4 reached a terminal state",
 	].join("\n\n");
-	expect(parseWake(text)).toEqual({ wake: true, taskIds: ["t1", "t2", "t3", "t4"] });
-	expect(parseWake("hello")).toEqual({ wake: false, taskIds: [] });
+	expect(parseWake(text)).toEqual({ wake: true, taskIds: ["t1", "t2", "t3", "t4"], noticeIds: [] });
+	expect(parseWake("hello")).toEqual({ wake: false, taskIds: [], noticeIds: [] });
+});
+
+test("wake parse: T3's continuation forms for one and several tasks", () => {
+	expect(parseWake("Delegated task t1 reached a terminal state. Use task_status with taskId t1 to read the result.").taskIds).toEqual(["t1"]);
+	expect(parseWake("Delegated tasks t1, t2 reached terminal states. Use task_status with each taskId to read the results.").taskIds).toEqual(["t1", "t2"]);
+});
+
+test("ledger: a question notice (live U19 text) is readable and keeps the task live; no fail-open", async () => {
+	const ledger = liveLedger(1);
+	const host = await ledgerHost(ledger, new FakeBridge());
+	// Text as observed in the live S4 run (parent session), ids shortened.
+	await host.emit("input", {
+		text: "Delegated task t1 is blocked on a question and cannot continue until it is answered. Read it with t3_pending_request_read using threadId th1 and requestId r1.",
+		source: "rpc",
+	});
+	await host.emit("input", { text: "Delegated task t1 asked a question and is still working.", source: "rpc" });
+	expect(liveIds(ledger)).toEqual(["t1"]);
+	expect(ledger.snapshot().enforcing).toBe(true);
+	expect(host.notifications).toEqual([]);
 });
 
 /** A FakePiHost with the ledger wired and the (deferred) bridge tools; `extra` loads after it. */
