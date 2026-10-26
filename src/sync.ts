@@ -1,0 +1,282 @@
+/**
+ * `/t3-sync-agents [--prune] [--yes]`: plans managed instances for every
+ * agent definition, shows the plan, confirms, and writes through the settings
+ * writer. Spec "Sync flow and settings writer".
+ */
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { DefaultPackageManager, loadSkills, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
+import { type AgentDefinition, agentConfigDir, agentsDir, readCatalog } from "./catalog.ts";
+import { type HostFacts, type InstancePlan, mainInstanceId, planInstance, PRODUCTION_NAMESPACE, tokenizeArgs } from "./planner.ts";
+import { isOwnedBy, jsonEqual, type ProviderInstanceEntry, type Settings, settingsShapeProblems } from "./settings-shape.ts";
+import { type WriteOutcome, type WriterHooks, writeSettings } from "./settings-writer.ts";
+
+export type SyncAction =
+	| { readonly kind: "add" | "update" | "unchanged"; readonly id: string; readonly agent: string; readonly entry: ProviderInstanceEntry }
+	| { readonly kind: "disable"; readonly id: string; readonly entry: ProviderInstanceEntry }
+	| { readonly kind: "prune"; readonly id: string }
+	| { readonly kind: "conflict"; readonly id: string; readonly agent: string };
+
+export interface SyncPlan {
+	readonly namespace: string;
+	readonly actions: readonly SyncAction[];
+	readonly skipped: readonly { agent: string; reason: string }[];
+	readonly gaps: readonly { agent: string; notes: readonly string[] }[];
+	readonly warnings: readonly string[];
+}
+
+export function settingsPath(env: NodeJS.ProcessEnv = process.env): string {
+	return env.PI_T3_SETTINGS_PATH ? resolve(env.PI_T3_SETTINGS_PATH) : join(homedir(), ".t3", "userdata", "settings.json");
+}
+
+export function namespaceOf(env: NodeJS.ProcessEnv = process.env): string {
+	return env.PI_T3_NAMESPACE || PRODUCTION_NAMESPACE;
+}
+
+export function stateDir(env: NodeJS.ProcessEnv = process.env): string {
+	return join(agentConfigDir(env), "t3-subagents");
+}
+
+/** Pure: planned entries plus the current settings give the sync actions. */
+export function planSync(input: {
+	readonly agents: readonly AgentDefinition[];
+	readonly settings: Settings;
+	readonly host: HostFacts;
+	readonly prune: boolean;
+}): SyncPlan {
+	const { host, settings } = input;
+	const ns = host.namespace;
+	const instances = settings.providerInstances ?? {};
+	const mainId = mainInstanceId(ns);
+	const actions: SyncAction[] = [];
+	const skipped: { agent: string; reason: string }[] = [];
+	const gaps: { agent: string; notes: readonly string[] }[] = [];
+	const planned = new Set<string>();
+	const keep = new Set<string>(); // Skipped agents: their existing entries stay as they are.
+
+	for (const agent of input.agents) {
+		if (!agent.enabled) continue;
+		const plan: InstancePlan = planInstance(agent, host);
+		if (plan.kind === "skip") {
+			skipped.push({ agent: plan.agent, reason: plan.reason });
+			keep.add(plan.id);
+			continue;
+		}
+		if (plan.gaps.length > 0) gaps.push({ agent: plan.agent, notes: plan.gaps });
+		planned.add(plan.id);
+		const existing = instances[plan.id];
+		if (existing === undefined) actions.push({ kind: "add", id: plan.id, agent: plan.agent, entry: plan.entry });
+		else if (!isOwnedBy(existing, ns)) actions.push({ kind: "conflict", id: plan.id, agent: plan.agent });
+		else if (jsonEqual(existing, plan.entry)) actions.push({ kind: "unchanged", id: plan.id, agent: plan.agent, entry: plan.entry });
+		else actions.push({ kind: "update", id: plan.id, agent: plan.agent, entry: plan.entry });
+	}
+
+	// Owned entries of this namespace without an enabled agent: disable first (D12).
+	// --prune deletes only entries already stored as disabled, so old threads stay readable until then.
+	for (const [id, entry] of Object.entries(instances)) {
+		if (id === mainId || planned.has(id) || keep.has(id) || !id.startsWith(ns) || !isOwnedBy(entry, ns)) continue;
+		if (entry.enabled !== false) actions.push({ kind: "disable", id, entry: { ...entry, enabled: false } });
+		else if (input.prune) actions.push({ kind: "prune", id });
+	}
+
+	const warnings: string[] = [...(host.notices ?? [])];
+	const main = instances[mainId];
+	if (!main) warnings.push(`main instance "${mainId}" not found in T3 settings`);
+	else if (!loadsExtension(main, host.extensionPath))
+		warnings.push(`main instance "${mainId}" does not load this extension (--extension ${host.extensionPath}); takeover is missing there`);
+
+	return { namespace: ns, actions, skipped, gaps, warnings };
+}
+
+function loadsExtension(entry: ProviderInstanceEntry, extensionPath: string): boolean {
+	const launchArgs = entry.config?.launchArgs;
+	if (typeof launchArgs !== "string") return false;
+	try {
+		const tokens = tokenizeArgs(launchArgs);
+		return tokens.some((t, i) => (t === "--extension" || t === "-e") && tokens[i + 1] === extensionPath);
+	} catch {
+		return false;
+	}
+}
+
+export const hasChanges = (plan: SyncPlan) => plan.actions.some((a) => a.kind !== "unchanged" && a.kind !== "conflict");
+
+/** Pure: apply the plan's changes to a copy of the settings. Other content is kept. */
+export function applyPlan(settings: Settings, plan: SyncPlan): Settings {
+	const instances: Record<string, ProviderInstanceEntry> = { ...(settings.providerInstances ?? {}) };
+	for (const action of plan.actions) {
+		if (action.kind === "add" || action.kind === "update" || action.kind === "disable") instances[action.id] = action.entry;
+		else if (action.kind === "prune") delete instances[action.id];
+	}
+	return { ...settings, providerInstances: instances };
+}
+
+/** Problems in reloaded settings: a planned entry that is missing or different. */
+export function verifyPlan(reloaded: unknown, plan: SyncPlan): string[] {
+	const instances = ((reloaded as Settings)?.providerInstances ?? {}) as Record<string, ProviderInstanceEntry>;
+	const problems: string[] = [];
+	for (const action of plan.actions) {
+		if (action.kind === "add" || action.kind === "update" || action.kind === "disable") {
+			if (!jsonEqual(instances[action.id], action.entry)) problems.push(`${action.id} is missing or different`);
+		} else if (action.kind === "prune" && instances[action.id] !== undefined) problems.push(`${action.id} still exists`);
+	}
+	return problems;
+}
+
+/** Plan text. Contains ids, agent names, reasons and notes; never environment values. */
+export function formatPlan(plan: SyncPlan): string {
+	const lines: string[] = [`T3 sync plan (namespace ${plan.namespace}):`];
+	const by = (k: SyncAction["kind"]) => plan.actions.filter((a) => a.kind === k).map((a) => a.id);
+	for (const kind of ["add", "update", "disable", "prune", "conflict", "unchanged"] as const) {
+		const ids = by(kind);
+		if (ids.length === 0) continue;
+		const label = kind === "conflict" ? "conflict (id exists without this sync's markers; not changed)" : kind;
+		lines.push(`  ${label}: ${ids.join(", ")}`);
+	}
+	for (const s of plan.skipped) lines.push(`  skip ${s.agent}: ${s.reason}`);
+	for (const g of plan.gaps) for (const note of g.notes) lines.push(`  gap ${g.agent}: ${note}`);
+	for (const w of plan.warnings) lines.push(`  warning: ${w}`);
+	if (!hasChanges(plan)) lines.push("  up to date");
+	return lines.join("\n");
+}
+
+/** Production host facts from the environment and the main instance (A12-A14). */
+export async function hostFacts(env: NodeJS.ProcessEnv, settings: Settings, extensionPath: string): Promise<HostFacts> {
+	const namespace = namespaceOf(env);
+	const configDir = agentConfigDir(env);
+	const home = homedir();
+	const mainBinary = settings.providerInstances?.[mainInstanceId(namespace)]?.config?.binaryPath;
+	const resources = await piResources(configDir, configDir);
+	return {
+		namespace,
+		extensionPath,
+		configDir,
+		agentsDir: agentsDir(env),
+		binaryPath: typeof mainBinary === "string" && mainBinary ? mainBinary : whichPi(),
+		home,
+		resolveSkill: (name) => resources.skills.get(name),
+		resolvePackage: resources.resolvePackage,
+		notices: resources.notices,
+	};
+}
+
+/**
+ * Pi's own resource view of the global configuration, without side effects:
+ * - skills: Pi's package manager resolves the configured skill paths, the
+ *   default skill folders and package skills, then Pi's `loadSkills` parses
+ *   them (nested folders included). Name -> absolute SKILL.md path.
+ * - packages: the installed path of an `npm:` or `git:` spec (versions and refs included).
+ * Nothing is installed: a configured package that is missing or has another
+ * version is skipped and reported (Pi's resolve() would install it otherwise).
+ * Global scope only: the instance serves every project.
+ */
+export async function piResources(
+	configDir: string,
+	cwd: string,
+): Promise<{ skills: Map<string, string>; resolvePackage: (spec: string) => string | undefined; notices: string[] }> {
+	const settingsManager = SettingsManager.create(cwd, configDir);
+	const packages = new DefaultPackageManager({ cwd, agentDir: configDir, settingsManager });
+	const notices: string[] = [];
+	const resolved = await packages.resolve(async (source) => {
+		notices.push(`configured Pi package ${source} is not installed (or has another version); its skills are not used. The sync does not install packages.`);
+		return "skip";
+	});
+	const skillPaths = resolved.skills.filter((r) => r.enabled && r.metadata.scope !== "project").map((r) => r.path);
+	const skills = new Map<string, string>();
+	for (const skill of loadSkills({ cwd, agentDir: configDir, skillPaths, includeDefaults: false }).skills) skills.set(skill.name, skill.filePath);
+	return { skills, resolvePackage: (spec) => packages.getInstalledPath(spec, "user"), notices };
+}
+
+function whichPi(): string {
+	try {
+		return execFileSync("/usr/bin/which", ["pi"], { encoding: "utf8" }).trim() || "pi";
+	} catch {
+		return "pi";
+	}
+}
+
+export interface SyncUi {
+	readonly hasUI: boolean;
+	confirm(title: string, message: string): Promise<boolean>;
+}
+
+export interface SyncRunOptions {
+	readonly args: string;
+	readonly env: NodeJS.ProcessEnv;
+	readonly extensionPath: string;
+	readonly ui: SyncUi;
+	/** Override of the host facts (tests). */
+	readonly host?: (settings: Settings) => HostFacts;
+	readonly reloadWaitMs?: number;
+	readonly hooks?: WriterHooks;
+}
+
+export interface SyncReport {
+	readonly status: "up-to-date" | "written" | "declined" | "needs-yes" | "refused" | "locked" | "changed" | "lock-lost" | "lost";
+	readonly text: string;
+	readonly plan?: SyncPlan;
+	readonly outcome?: WriteOutcome;
+}
+
+const SYNC_FLAGS = ["--prune", "--yes", "--break-lock"];
+
+export function parseSyncArgs(args: string): { prune: boolean; yes: boolean; breakLock: boolean; unknown: string[] } {
+	const tokens = args.split(/\s+/).filter(Boolean);
+	return {
+		prune: tokens.includes("--prune"),
+		yes: tokens.includes("--yes"),
+		breakLock: tokens.includes("--break-lock"),
+		unknown: tokens.filter((t) => !SYNC_FLAGS.includes(t)),
+	};
+}
+
+export async function runSync(opts: SyncRunOptions): Promise<SyncReport> {
+	const { prune, yes, breakLock, unknown } = parseSyncArgs(opts.args);
+	if (unknown.length > 0) return { status: "refused", text: `Unknown arguments: ${unknown.join(" ")}. Usage: /t3-sync-agents [--prune] [--yes] [--break-lock]` };
+	const path = settingsPath(opts.env);
+	let originalText: string;
+	let settings: Settings;
+	try {
+		originalText = readFileSync(path, "utf8");
+		settings = JSON.parse(originalText);
+	} catch (error) {
+		return { status: "refused", text: `Cannot read T3 settings at ${path}: ${(error as Error).message}` };
+	}
+	const shape = settingsShapeProblems(settings);
+	if (shape.length > 0) return { status: "refused", text: `T3 settings have an unexpected shape (C6); no write:\n  ${shape.join("\n  ")}` };
+
+	const host = opts.host ? opts.host(settings) : await hostFacts(opts.env, settings, opts.extensionPath);
+	const catalog = readCatalog(host.agentsDir);
+	const plan = planSync({ agents: catalog.agents, settings, host, prune });
+	const unreadable = catalog.unreadable.map((u) => `  unreadable agent file ${u.path}: ${u.reason}`);
+	const text = [formatPlan(plan), ...unreadable].join("\n");
+	if (!hasChanges(plan)) return { status: "up-to-date", text, plan };
+
+	if (!yes) {
+		if (!opts.ui.hasUI) return { status: "needs-yes", text: `${text}\nNo UI to confirm: run /t3-sync-agents --yes to write.`, plan };
+		if (!(await opts.ui.confirm("Write T3 settings?", text))) return { status: "declined", text: `${text}\nNot written.`, plan };
+	}
+
+	const next = applyPlan(settings, plan);
+	const outcome = await writeSettings({
+		settingsPath: path,
+		stateDir: stateDir(opts.env),
+		originalText,
+		nextText: `${JSON.stringify(next, null, 2)}\n`,
+		verify: (reloaded) => verifyPlan(reloaded, plan),
+		breakLock,
+		reloadWaitMs: opts.reloadWaitMs,
+		hooks: opts.hooks,
+	});
+	const counts = ["add", "update", "disable", "prune"]
+		.map((k) => `${k} ${plan.actions.filter((a) => a.kind === k).length}`)
+		.join(", ");
+	if (outcome.status === "locked") return { status: "locked", text: `${text}\nNot written: ${outcome.message}`, plan, outcome };
+	if (outcome.status === "changed" || outcome.status === "lock-lost") return { status: outcome.status, text: `${text}\n${outcome.message}`, plan, outcome };
+	if (outcome.status === "lost")
+		return { status: "lost", text: `${text}\n${outcome.message} (${outcome.problems.join("; ")}). Backup: ${outcome.backupPath}`, plan, outcome };
+	const broke = outcome.brokenLock ? `\nRemoved lock (--break-lock): ${outcome.brokenLock.path}, ${outcome.brokenLock.state}, holder ${outcome.brokenLock.pid ?? "unknown"} on ${outcome.brokenLock.host ?? "unknown"}.` : "";
+	return { status: "written", text: `${text}${broke}\nWritten: ${counts}. Backup: ${outcome.backupPath}`, plan, outcome };
+}

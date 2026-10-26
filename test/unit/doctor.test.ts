@@ -1,10 +1,21 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createExtension } from "../../index.ts";
 import { resetCopyRegistry } from "../../src/takeover.ts";
 import { FakePiHost, fakeForeignSubagent, fakePiSubagents } from "../harness/fake-pi.ts";
 
 const OURS = "/ext/pi-t3-subagents/index.ts";
-const T3_ENV = { T3_MCP_URL: "http://127.0.0.1:1/mcp", T3_MCP_BEARER_TOKEN: "fake-token" };
+// C6 and C7 (S2) read T3 settings: point them at a temporary empty settings file, never the real one.
+const SETTINGS_DIR = mkdtempSync(join(tmpdir(), "doctor-settings-"));
+writeFileSync(join(SETTINGS_DIR, "settings.json"), "{}\n");
+afterAll(() => rmSync(SETTINGS_DIR, { recursive: true, force: true }));
+const T3_ENV = {
+	T3_MCP_URL: "http://127.0.0.1:1/mcp",
+	T3_MCP_BEARER_TOKEN: "fake-token",
+	PI_T3_SETTINGS_PATH: join(SETTINGS_DIR, "settings.json"),
+};
 const BRIDGE = "builtin:mcp";
 
 afterEach(() => resetCopyRegistry());
@@ -45,11 +56,11 @@ async function boot(extra: Array<[string, (pi: any) => void]> = [], copies: stri
 }
 
 describe("doctor inside T3", () => {
-	test("healthy session: C1, C2 and C3 pass", async () => {
+	test("healthy session: C1, C2, C3, C6 and C7 pass", async () => {
 		const host = await boot();
 		addBridge(host);
 		const lines = await doctorLines(host);
-		expect([...lines.keys()]).toEqual(["C1", "C2", "C3"]);
+		expect([...lines.keys()]).toEqual(["C1", "C2", "C3", "C6", "C7"]);
 		for (const line of lines.values()) expect(line).toContain(" PASS ");
 	});
 
