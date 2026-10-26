@@ -35,6 +35,7 @@ import { guardCheck, installRawDelegationGuard } from "./src/raw-delegation-guar
 import { installChildTools } from "./src/child-tools.ts";
 import { installLedger, wakeFormatCheck } from "./src/ledger.ts";
 import { ledgerOf } from "./src/subagent-tool.ts";
+import { installCallerPing } from "./src/caller-ping.ts";
 import { runLimitsInstaller } from "./src/run-limits.ts";
 
 type Env = Record<string, string | undefined>;
@@ -76,6 +77,7 @@ export function createExtension(env: Env = process.env, copyId: string = import.
 		// that owns the takeover, so a second copy cannot register a duplicate tool or a second timer.
 		installManagedChildTools(pi, child, takeover, [
 			// [slot S6] caller_ping and its run latch: begin
+			installCallerPing,
 			// [slot S6] end
 			// [slot S7] context warnings and time limit: begin
 			// Thresholds come from the current agent file, read again at the start of each run.
