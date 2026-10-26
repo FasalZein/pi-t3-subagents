@@ -7,6 +7,7 @@ The sync must add and change provider instances in T3's `settings.json`. T3 offe
 - The README states the remaining risk. The sync is a rare, manual action, so the window rarely matters.
 - All writes (sync, live-test setup and teardown, rollout) go through one settings writer.
 - The own-writer lock sits next to the settings file, so every Pi profile that writes one settings file shares it. The sync never removes a lock on its own (owner decision 2026-10-26): a lock of a live holder on this host is busy and is never broken; any other lock (holder gone, another host, unreadable, malformed) stops the sync with the lock details, and the user removes it once with `/t3-sync-agents --break-lock`, which refuses when the lock changed since it was read. Automatic stale-lock takeover was rejected: two review rounds found races in which an old takeover decision removed a live writer's lock.
+- `--break-lock` refuses when it cannot read the lock file's identity, and it re-checks the identity and content immediately before the removal. Accepted risk, next to the T3-save race: a file system has no compare-and-delete, so if a user runs `--break-lock` on a dead lock while a new sync takes the lock in the same instant, that new lock can be removed. The displaced sync does not commit when it notices the lost ownership; it can still commit if it had already passed its last ownership check. Closing this window would need a lock service outside the file system.
 
 ## Considered options
 

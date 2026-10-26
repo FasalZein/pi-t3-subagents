@@ -622,6 +622,40 @@ describe("settings writer interleavings", () => {
 		lock.release();
 	});
 
+	test("--break-lock refuses and removes nothing when the lock identity cannot be read (stat fails), even if the lock was replaced", async () => {
+		const h = host();
+		const pid = deadPid();
+		writeFileSync(lockFile(h), `${pid} ${hostname()} ${uuid}`);
+		const live = `${process.pid} ${hostname()} 11111111-2222-4333-8444-555555555555`;
+		const failingStat = () => {
+			throw Object.assign(new Error("EIO"), { code: "EIO" });
+		};
+		await expect(acquireLock(h.settingsPath, { breakLock: true, stat: failingStat, beforeBreak: () => writeFileSync(lockFile(h), live) })).rejects.toThrow(
+			"--break-lock refused: the lock file identity cannot be read",
+		);
+		expect(readFileSync(lockFile(h), "utf8")).toBe(`${pid} ${hostname()} ${uuid}`);
+		// Identity readable at first, unreadable at the re-check: also refused.
+		let calls = 0;
+		const flakyStat = (path: string) => {
+			if (++calls > 1) throw Object.assign(new Error("EIO"), { code: "EIO" });
+			return statSync(path);
+		};
+		await expect(acquireLock(h.settingsPath, { breakLock: true, stat: flakyStat, beforeBreak: () => writeFileSync(lockFile(h), live) })).rejects.toThrow("--break-lock refused");
+		expect(readFileSync(lockFile(h), "utf8")).toBe(live);
+	});
+
+	test("accepted window (ADR 0005): a lock taken between the last check and the unlink is removed; its holder then sees it does not own the lock", async () => {
+		const h = host();
+		writeFileSync(lockFile(h), `${deadPid()} ${hostname()} ${uuid}`);
+		const replacement = `${process.pid} ${hostname()} 11111111-2222-4333-8444-555555555555`;
+		const breaker = await acquireLock(h.settingsPath, { breakLock: true, afterVerify: () => writeFileSync(lockFile(h), replacement) });
+		// The replacement was removed by the unlink; the breaker now holds the lock.
+		expect(breaker.owns()).toBe(true);
+		expect(readFileSync(lockFile(h), "utf8")).not.toBe(replacement);
+		// A writer whose token was replaced does not commit (lock-lost), so the window only matters after its last ownership check.
+		breaker.release();
+	});
+
 	test("release removes only the writer's own lock", async () => {
 		const h = host();
 		const a = await acquireLock(h.settingsPath);

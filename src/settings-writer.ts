@@ -80,8 +80,11 @@ export interface LockInfo {
 	readonly pid?: number;
 	readonly host?: string;
 	readonly ageMs?: number;
-	/** Content if readable, plus file identity; --break-lock removes the lock only while this is unchanged. */
-	readonly fingerprint: string;
+	/**
+	 * Device, inode, size, mtime and (if readable) content. Undefined when the
+	 * identity cannot be read (stat failed): --break-lock then refuses.
+	 */
+	readonly fingerprint?: string;
 }
 
 export class LockError extends Error {
@@ -97,15 +100,15 @@ const MAX_PID = 4_194_304; // Upper bound of pid values on macOS and Linux.
 const TOKEN = /^(\d+) (\S+) ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
 
 /** Reads and classifies a lock file. Returns undefined when it does not exist. Never removes anything. */
-export function inspectLock(path: string): LockInfo | undefined {
-	let st: ReturnType<typeof statSync>;
+export function inspectLock(path: string, stat: (path: string) => { dev: number; ino: number; size: number; mtimeMs: number } = statSync): LockInfo | undefined {
+	let st: { dev: number; ino: number; size: number; mtimeMs: number };
 	try {
-		st = statSync(path);
+		st = stat(path);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-		return { path, state: "unreadable", fingerprint: "stat-failed" };
+		return { path, state: "unreadable" }; // No identity: --break-lock refuses.
 	}
-	const identity = `${st.ino}:${st.size}:${st.mtimeMs}`;
+	const identity = `${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}`;
 	const ageMs = Math.max(0, Date.now() - st.mtimeMs);
 	let text: string;
 	try {
@@ -144,8 +147,12 @@ export interface AcquireOptions {
 	readonly waitMs?: number;
 	/** Remove one non-live lock whose content is unchanged since it was read (user-confirmed by --break-lock). */
 	readonly breakLock?: boolean;
-	/** Test hook: runs after a lock was inspected for --break-lock and before it is removed. */
+	/** Test hook: runs after a lock was inspected for --break-lock and before it is verified again. */
 	readonly beforeBreak?: () => void;
+	/** Test hook: runs after the last verification and before the unlink (the accepted window). */
+	readonly afterVerify?: () => void;
+	/** Test seam: stat used to read the lock file identity. */
+	readonly stat?: (path: string) => { dev: number; ino: number; size: number; mtimeMs: number };
 }
 
 export async function acquireLock(settingsPath: string, options: AcquireOptions = {}): Promise<WriterLock> {
@@ -178,7 +185,7 @@ export async function acquireLock(settingsPath: string, options: AcquireOptions 
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 		}
-		const info = inspectLock(path);
+		const info = inspectLock(path, options.stat);
 		if (info && info.state === "live") {
 			if (Date.now() >= deadline)
 				throw new LockError(`settings writer lock is busy: ${describe(info)}. A running writer holds it; --break-lock never removes a live holder's lock.`, info);
@@ -188,10 +195,16 @@ export async function acquireLock(settingsPath: string, options: AcquireOptions 
 					`settings writer lock is held but its holder is not running here: ${describe(info)}. The sync does not remove locks on its own. If no sync is running, run /t3-sync-agents --break-lock.`,
 					info,
 				);
+			if (info.fingerprint === undefined)
+				throw new LockError(`--break-lock refused: the lock file identity cannot be read, so a change cannot be detected: ${describe(info)}. Remove it by hand if no sync is running.`, info);
 			options.beforeBreak?.();
-			const now = inspectLock(path);
-			if (!now || now.fingerprint !== info.fingerprint || now.state === "live")
-				throw new LockError(`--break-lock refused: the lock changed since it was read: ${describe(now ?? info)}. Run the sync again.`, now ?? info);
+			// Re-read and re-verify immediately before the unlink. A filesystem has no
+			// compare-and-delete, so a window between this check and the unlink remains
+			// (accepted risk, ADR 0005 and spec step 5).
+			const now = inspectLock(path, options.stat);
+			if (!now || now.fingerprint === undefined || now.fingerprint !== info.fingerprint || now.state === "live")
+				throw new LockError(`--break-lock refused: the lock changed since it was read, or its identity cannot be read: ${describe(now ?? info)}. Run the sync again.`, now ?? info);
+			options.afterVerify?.();
 			unlinkSync(path);
 			broken = info;
 			continue;
