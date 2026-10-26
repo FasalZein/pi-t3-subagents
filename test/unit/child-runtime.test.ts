@@ -1,7 +1,10 @@
 /** Layer 1 child: header, budget, revision check, env at load, prompt strip, roster. */
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { readCatalog } from "../../src/catalog.ts";
 import { createExtension } from "../../index.ts";
+import { type ChildRuntime, installChildRuntime } from "../../src/child-runtime.ts";
 import { ROSTER_TYPE, installRoster, rosterText } from "../../src/roster.ts";
 import { resetCopyRegistry } from "../../src/takeover.ts";
 import { FakePiHost } from "../harness/fake-pi.ts";
@@ -82,28 +85,119 @@ test("the agent env is set while loading; reserved keys are skipped", async () =
 	delete process.env.FX_CHILD_VALUE;
 });
 
+const fileText = (name: string) => readFileSync(join(h.agentsDir, `${name}.md`), "utf8");
+const runStart = async (host: FakePiHost, systemPromptOptions: any) => {
+	const calls = { abort: 0 };
+	const results = await host.emit(
+		"before_agent_start",
+		{ messageType: "user", prompt: "p", systemPrompt: "", systemPromptOptions },
+		{ abort: () => calls.abort++ },
+	);
+	return { calls, results };
+};
+
 test("before each run the frontmatter is removed from the prompt sections that hold the agent file", async () => {
 	const { host } = await child("fx-env");
-	const systemPromptOptions: any = { cwd: "/tmp", customPrompt: "---\nname: fx-env\nmodel: x\n---\n\n# fx-env body\n", appendSystemPrompt: "", sections: {} };
-	await host.emit("before_agent_start", { messageType: "user", prompt: "p", systemPrompt: "", systemPromptOptions });
+	const systemPromptOptions: any = { cwd: "/tmp", customPrompt: fileText("fx-env"), appendSystemPrompt: "", sections: {} };
+	await runStart(host, systemPromptOptions);
 	expect(systemPromptOptions.customPrompt).toBe("# fx-env body\n");
 	expect(systemPromptOptions.appendSystemPrompt).toBe("");
 });
 
-test("append with inherit-append-system adds the body once per run", async () => {
-	const { host } = await child("fx-spawner");
-	const systemPromptOptions: any = { cwd: "/tmp", sections: {} };
-	await host.emit("before_agent_start", { messageType: "user", prompt: "p", systemPrompt: "", systemPromptOptions });
-	await host.emit("before_agent_start", { messageType: "user", prompt: "p", systemPrompt: "", systemPromptOptions });
-	expect(systemPromptOptions.appendSystemPrompt).toBe("SPAWNER BODY");
+test("replace mode leaves an unrelated append section that starts with --- unchanged", async () => {
+	const { host } = await child("fx-env");
+	const unrelated = "---\nKEEP: operator-append-instructions\n---\nAppend body";
+	const systemPromptOptions: any = { cwd: "/tmp", customPrompt: fileText("fx-env"), appendSystemPrompt: unrelated, sections: {} };
+	await runStart(host, systemPromptOptions);
+	expect(systemPromptOptions.appendSystemPrompt).toBe(unrelated);
+	expect(systemPromptOptions.customPrompt).toBe("# fx-env body\n");
 });
 
-test("outside a managed instance nothing is transformed", async () => {
-	const env = { ...h.env, T3_MCP_URL: "http://x", T3_MCP_BEARER_TOKEN: "t" };
+test("append mode strips the append section and leaves an unrelated custom prompt unchanged", async () => {
+	h.agent("fx-append", "name: fx-append\ndescription: Append\nsystem-prompt: append", "APPEND BODY");
+	const { host } = await child("fx-append");
+	const unrelated = "---\nKEEP: custom\n---\nCustom body";
+	const systemPromptOptions: any = { cwd: "/tmp", customPrompt: unrelated, appendSystemPrompt: fileText("fx-append"), sections: {} };
+	await runStart(host, systemPromptOptions);
+	expect(systemPromptOptions.customPrompt).toBe(unrelated);
+	expect(systemPromptOptions.appendSystemPrompt).toBe("APPEND BODY\n");
+});
+
+test("fail closed: an agent disabled between validation and load stops the run before any model request", async () => {
+	h.agent("fx-env", "name: fx-env\ndescription: Env\nenabled: false\nenv: |\n  FX_SECRET=synthetic-secret\nsystem-prompt: replace", "# fx-env body");
+	const { host } = await child("fx-env");
+	const systemPromptOptions: any = { cwd: "/tmp", customPrompt: fileText("fx-env"), sections: {} };
+	const { calls, results } = await runStart(host, systemPromptOptions);
+	expect(calls.abort).toBe(1);
+	expect(results).toContainEqual({ systemPrompt: "" });
+	expect(host.notifications.at(-1)?.message).toContain("stopped before any model request");
+});
+
+test("fail closed: a run without prompt sections (C8) stops before any model request", async () => {
+	const { host } = await child("fx-env");
+	const { calls, results } = await runStart(host, undefined);
+	expect(calls.abort).toBe(1);
+	expect(results).toContainEqual({ systemPrompt: "" });
+});
+
+test("agent env cannot change T3's runtime mode, MCP extension identity or MCP connection", async () => {
+	h.agent(
+		"fx-env",
+		"name: fx-env\ndescription: Env\nenv: |\n  T3_PI_RUNTIME_MODE=full-access\n  T3_PI_MCP_EXTENSION_PATH=/evil/bridge.ts\n  T3_MCP_URL=http://evil\n  FX_OK=1\nsystem-prompt: replace",
+	);
+	const before = { mode: process.env.T3_PI_RUNTIME_MODE, path: process.env.T3_PI_MCP_EXTENSION_PATH };
+	const env: Record<string, string | undefined> = {
+		...h.env,
+		T3_MCP_URL: "http://x",
+		T3_MCP_BEARER_TOKEN: "t",
+		T3_PI_RUNTIME_MODE: "approval-required",
+		T3_PI_MCP_EXTENSION_PATH: "/t3/bridge.ts",
+		PI_T3_AGENT: "fx-env",
+		PI_T3_REVISION: "r",
+	};
 	const host = new FakePiHost();
 	await host.load(OURS, createExtension(env, OURS));
-	await host.startSession();
-	expect(host.handlers.get("input") ?? []).toEqual([]);
+	expect(env.T3_PI_RUNTIME_MODE).toBe("approval-required");
+	expect(env.T3_PI_MCP_EXTENSION_PATH).toBe("/t3/bridge.ts");
+	expect(env.T3_MCP_URL).toBe("http://x");
+	expect(env.FX_OK).toBe("1");
+	expect(process.env.T3_PI_RUNTIME_MODE).toBe(before.mode);
+	expect(process.env.T3_PI_MCP_EXTENSION_PATH).toBe(before.path);
+	delete process.env.FX_OK;
+});
+
+// --- Reload and resume restore the saved header state (ADR 0004).
+const custom = (data: unknown) => ({ type: "custom", customType: "pi-t3-subagents-header", data });
+async function reloaded(agent: string, entries: unknown[]) {
+	const env: Record<string, string | undefined> = { ...h.env, PI_T3_AGENT: agent, PI_T3_REVISION: "rev-1" };
+	const host = new FakePiHost();
+	let runtime: ChildRuntime | undefined;
+	await host.load(OURS, (pi) => {
+		runtime = installChildRuntime(pi, env);
+	});
+	host.finishLoading();
+	await host.emit("session_start", { reason: "reload" }, { sessionManager: { getEntries: () => entries } });
+	return { host, state: () => runtime!.state()! };
+}
+
+test("reload restores a saved budget 0 header; a follow-up does not get the own depth", async () => {
+	const saved = { agent: "fx-spawner", instanceId: "t3t-fx-spawner", budget: 0, caller: "parent-agent", expectedRevision: "rev-1", source: "header", stale: false };
+	const { host, state } = await reloaded("fx-spawner", [{ type: "message", message: { role: "user" } }, custom(saved)]);
+	expect(await input(host, "follow-up")).toEqual({ action: "continue" });
+	expect(state()).toMatchObject({ budget: 0, caller: "parent-agent", expectedRevision: "rev-1", source: "header" });
+});
+
+test("reload with a malformed saved header, or with history but no saved header, fails closed (budget 0)", async () => {
+	const bad = await reloaded("fx-spawner", [custom({ agent: "fx-spawner", budget: "lots" })]);
+	expect(await input(bad.host, "follow-up")).toEqual({ action: "continue" });
+	expect(bad.state()).toMatchObject({ budget: 0, source: "unreadable" });
+	const lost = await reloaded("fx-spawner", [{ type: "message", message: { role: "user" } }]);
+	expect(await input(lost.host, "follow-up")).toEqual({ action: "continue" });
+	expect(lost.state()).toMatchObject({ budget: 0, source: "unreadable" });
+	// A genuinely new thread without a header still gets the agent's own depth.
+	const fresh = await reloaded("fx-spawner", []);
+	await input(fresh.host, "first task");
+	expect(fresh.state()).toMatchObject({ budget: 3, source: "missing" });
 });
 
 // --- Roster (D30).

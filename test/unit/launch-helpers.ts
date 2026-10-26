@@ -69,7 +69,11 @@ export function launchFixture(): LaunchFixture {
 			const ctx = bridge.toolContext({
 				cwd,
 				model: { provider: "cpa", id: "claude-opus-5-5" },
-				modelRegistry: { find: (_p: string, id: string) => ({ reasoning: id !== "plain-model" }) },
+				modelRegistry: {
+					find: (_p: string, id: string) => ({ reasoning: id !== "plain-model" }),
+					getAvailable: () => [{ provider: "cpa", id: "claude-haiku-5-5" }, { provider: "cpa", id: "claude-sonnet-5-5" }],
+					getAll: () => [],
+				},
 			});
 			return tool.execute(toolCallId, params, undefined, undefined, ctx);
 		},

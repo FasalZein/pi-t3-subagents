@@ -61,6 +61,8 @@ export interface LaunchContext {
 	readonly parentThinking?: string;
 	/** Whether a concrete `provider/id` advertises thinking (T3 rejects options otherwise). */
 	readonly supportsThinking: (slug: string) => boolean;
+	/** Pi's registry: a bare model id (optionally with a --provider hint) to `provider/id`, or undefined. */
+	readonly resolveModel?: (id: string, provider?: string) => string | undefined;
 	readonly host: HostFacts;
 	readonly settings: Settings;
 	/** The bridge tool is registered and callable in this session (C3). */
@@ -181,13 +183,18 @@ function modelAllowed(effective: string, allowed: string): boolean {
 export function resolveTarget(
 	agent: AgentDefinition,
 	params: LaunchParams,
-	ctx: Pick<LaunchContext, "parentModel" | "parentThinking" | "supportsThinking">,
+	ctx: Pick<LaunchContext, "parentModel" | "parentThinking" | "supportsThinking" | "resolveModel">,
 	instanceId: string,
 ): { target: Target; modelLabel: string; overrideModel?: string; overrideThinking?: string } {
+	// A configured bare id (for example `model: claude-haiku-5-5` with `flags: --provider x`)
+	// is resolved through Pi's registry before the A1 comparison and the allowlist.
+	const providerHint = agent.fields.flags?.match(/(?:^|\s)--provider(?:=|\s+)("?)([^\s"]+)\1/)?.[2];
+	const qualify = (ref: { model: string; thinking?: string }) =>
+		ref.model.includes("/") ? ref : { ...ref, model: ctx.resolveModel?.(ref.model, providerHint) ?? ref.model };
 	const allowOverride = agent.fields["allow-model-override"] !== "false";
-	const override = allowOverride && params.model ? splitModelRef(params.model.trim()) : undefined;
+	const override = allowOverride && params.model ? qualify(splitModelRef(params.model.trim())) : undefined;
 	const overrideThinking = allowOverride ? params.thinking?.trim() || override?.thinking : undefined;
-	const agentModel = agent.fields.model ? splitModelRef(agent.fields.model) : undefined;
+	const agentModel = agent.fields.model ? qualify(splitModelRef(agent.fields.model)) : undefined;
 	const agentThinking = agentModel?.thinking ?? agent.fields.thinking;
 	const parent = ctx.parentModel ? splitModelRef(ctx.parentModel) : undefined;
 
@@ -198,7 +205,7 @@ export function resolveTarget(
 	if (allowed.length > 0) {
 		const effectiveRef = refOf(effectiveModel, effectiveThinking);
 		const own = refOf(agentModel?.model ?? parent?.model, agentThinking ?? parent?.thinking ?? ctx.parentThinking);
-		const refs = [...(own ? [own] : []), ...allowed];
+		const refs = [...(own ? [own] : []), ...allowed.map((r) => { const q = qualify(splitModelRef(r)); return refOf(q.model, q.thinking)!; })];
 		if (!effectiveRef) throw new LaunchError(`Agent '${agent.name}' defines allowed-models but no model was resolved.`);
 		if (!refs.some((r) => modelAllowed(effectiveRef, r)))
 			throw new LaunchError(`Model '${effectiveRef}' is not allowed for agent '${agent.name}'. Allowed models: ${refs.join(", ")}.`);
@@ -282,6 +289,8 @@ export async function prepareLaunch(params: LaunchParams, ctx: LaunchContext, ca
 	const agentName = params.agent?.trim();
 	if (!agentName) fail("agent is required.");
 	if (!params.task?.trim()) fail("task is required.");
+	// D18: a project agent overrides a same-named global one, so it is refused even then.
+	if (ctx.projectAgents.includes(agentName!)) fail(`agent '${agentName}' is a project agent; T3 supports global agents only (D18).`);
 	const agent = ctx.agents.find((a) => a.name === agentName);
 	if (!agent) {
 		if (ctx.disabled.includes(agentName!)) fail(`agent '${agentName}' is disabled (enabled: false).`);

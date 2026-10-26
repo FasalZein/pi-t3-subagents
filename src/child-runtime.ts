@@ -23,9 +23,31 @@ export const AGENT_ENV = "PI_T3_AGENT";
 export const REVISION_ENV = "PI_T3_REVISION";
 export const HEADER_ENTRY = "pi-t3-subagents-header";
 
-/** Keys the agent `env` may not set: this extension's, T3's bridge and pi-subagents' spawn keys. */
+/**
+ * Keys the agent `env` may not set: this extension's, every T3 control variable (`T3_*`:
+ * the bridge's MCP connection, `T3_PI_RUNTIME_MODE` approval policy and
+ * `T3_PI_MCP_EXTENSION_PATH` identity) and pi-subagents' spawn keys.
+ */
 export function isReservedEnvKey(key: string): boolean {
-	return key.startsWith("PI_T3_") || key.startsWith("T3_MCP_") || key.startsWith("PI_SUBAGENT_") || key === "PI_DENY_TOOLS";
+	return key.startsWith("PI_T3_") || key.startsWith("T3_") || key.startsWith("PI_SUBAGENT_") || key === "PI_DENY_TOOLS";
+}
+
+const HEADER_SOURCES: readonly HeaderSource[] = ["header", "missing", "unreadable"];
+
+/** A saved header entry, validated; undefined when malformed. */
+export function restoredState(data: unknown, agent: string, instanceId: string): ChildState | undefined {
+	const d = data as Partial<ChildState> | null;
+	if (!d || typeof d !== "object" || d.agent !== agent || d.instanceId !== instanceId) return undefined;
+	if (!Number.isInteger(d.budget) || (d.budget as number) < 0 || typeof d.stale !== "boolean") return undefined;
+	if (!HEADER_SOURCES.includes(d.source as HeaderSource)) return undefined;
+	if (d.caller !== undefined && typeof d.caller !== "string") return undefined;
+	if (d.expectedRevision !== undefined && typeof d.expectedRevision !== "string") return undefined;
+	return { agent, instanceId, budget: d.budget, caller: d.caller, expectedRevision: d.expectedRevision, source: d.source, stale: d.stale };
+}
+
+/** The leading frontmatter block of an agent file, without its line end. */
+function frontmatterBlock(text: string): string | undefined {
+	return text.match(/^---\r?\n[\s\S]*?\r?\n---[ \t]*/)?.[0];
 }
 
 export type HeaderSource = "header" | "missing" | "unreadable";
@@ -102,6 +124,23 @@ export function installChildRuntime(pi: ExtensionAPI, env: Env): ChildRuntime | 
 	let promptSections: boolean | undefined;
 	let inputSeen = false;
 
+	// Reload or resume: Pi rebuilds this extension, so restore the saved header state of
+	// this session. A session with earlier user messages but no valid saved state fails
+	// closed (budget 0); only a new thread may take the own-depth fallback.
+	pi.on("session_start", async (_event, ctx) => {
+		if (headerSeen) return;
+		const entries: any[] = (ctx as any)?.sessionManager?.getEntries?.() ?? [];
+		const saved = entries.filter((e) => e?.type === "custom" && e.customType === HEADER_ENTRY).at(-1);
+		const hadInput = entries.some((e) => e?.type === "message" && e.message?.role === "user");
+		if (saved) {
+			state = restoredState(saved.data, agentName, instanceId) ?? { ...state, budget: 0, source: "unreadable" };
+			headerSeen = true;
+		} else if (hadInput) {
+			state = { ...state, budget: 0, source: "unreadable" };
+			headerSeen = true;
+		}
+	});
+
 	pi.on("input", async (event) => {
 		inputSeen = true;
 		if (headerSeen) return { action: "continue" };
@@ -124,14 +163,27 @@ export function installChildRuntime(pi: ExtensionAPI, env: Env): ChildRuntime | 
 		return { action: "transform", text: stale ? staleInstruction(instanceId, parsed.revision, running) : parsed.rest };
 	});
 
-	pi.on("before_agent_start", async (event) => {
+	pi.on("before_agent_start", async (event, ctx) => {
 		const options: any = (event as any).systemPromptOptions;
 		promptSections = !!options && typeof options === "object";
-		if (!promptSections || !agent) return;
-		// D14: strip a leading frontmatter block only in the sections that hold the agent file.
-		for (const key of ["customPrompt", "appendSystemPrompt"] as const) {
-			const value = options[key];
-			if (typeof value === "string" && value.startsWith("---")) options[key] = stripFrontmatter(value).replace(/^\s+/, "");
+		// Fail closed: without the agent definition or the prompt sections, the agent file's
+		// frontmatter (env values included) could reach the model. Stop before any request.
+		if (!promptSections || !agent) {
+			const why = !agent
+				? `agent '${agentName}' is not an enabled global agent in ${agentsDir(env as NodeJS.ProcessEnv)}`
+				: "Pi gave no systemPromptOptions (C8)";
+			(ctx as any)?.ui?.notify?.(`pi-t3-subagents: run stopped before any model request: ${why}. Run /t3-sync-agents and launch again.`, "error");
+			(ctx as any)?.abort?.();
+			return { systemPrompt: "" };
+		}
+		// D14: strip the frontmatter only in the section that holds the agent file.
+		const mode = agent.fields["system-prompt"];
+		const key = mode === "replace" ? "customPrompt" : mode === "append" && agent.fields["inherit-append-system"] !== "true" ? "appendSystemPrompt" : undefined;
+		const block = key ? frontmatterBlock(readFileSync(agent.path, "utf8")) : undefined;
+		const value = key ? options[key] : undefined;
+		if (key && block && typeof value === "string") {
+			const at = value.indexOf(block);
+			if (at >= 0) options[key] = value.slice(0, at) + value.slice(at + block.length).replace(/^\s+/, "");
 		}
 		if (agent.fields["system-prompt"] === "append" && agent.fields["inherit-append-system"] === "true") {
 			const body = stripFrontmatter(readFileSync(agent.path, "utf8")).trim();

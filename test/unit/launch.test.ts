@@ -3,7 +3,8 @@
  * Expected values come from the spec text, not from the code under test.
  */
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { FakeBridge } from "../harness/fake-bridge.ts";
 import { join } from "node:path";
 import { launchKey } from "../../src/launch-planner.ts";
 import type { LaunchOutcome } from "../../src/subagent-tool.ts";
@@ -72,6 +73,13 @@ test("validation: a missing instance is refused with the sync message", async ()
 	expect(bridge.calls).toEqual([]);
 });
 
+test("validation: a project agent that overrides a same-named global agent is refused (D18)", async () => {
+	writeProjectAgent(f.cwd, "fx-leaf");
+	const bridge = f.bridge();
+	await expect(f.run(f.tool(), bridge, { ...base, agent: "fx-leaf" })).rejects.toThrow(/agent 'fx-leaf' is a project agent/);
+	expect(bridge.calls).toEqual([]);
+});
+
 test("validation: a missing bridge tool is refused before any call", async () => {
 	const outcomes: LaunchOutcome[] = [];
 	const bridge = f.bridge();
@@ -115,6 +123,50 @@ test("A1: thinking is not sent for a model without thinking support", async () =
 	f.h.agent("fx-leaf", "name: fx-leaf\ndescription: Leaf\nmodel: cpa/claude-haiku-5-5\nthinking: low\nsystem-prompt: replace");
 	f.sync();
 	expect(await target("fx-leaf", { model: "cpa/plain-model" })).toEqual({ providerInstanceId: "t3t-fx-leaf", model: "cpa/plain-model", options: {} });
+});
+
+test("A1: a configured bare model is resolved through Pi's registry when thinking is inherited", async () => {
+	f.h.agent("fx-bare", "name: fx-bare\ndescription: Bare\nmodel: claude-haiku-5-5\nsystem-prompt: replace");
+	f.h.agent("fx-bare-locked", "name: fx-bare-locked\ndescription: Bare locked\nmodel: claude-haiku-5-5\nallow-model-override: false\nflags: --provider cpa\nsystem-prompt: replace");
+	f.sync();
+	expect(await target("fx-bare")).toEqual({ providerInstanceId: "t3t-fx-bare", model: "cpa/claude-haiku-5-5", options: { thinking: "medium" } });
+	expect(await target("fx-bare-locked", { model: "cpa/other", thinking: "high" })).toEqual({
+		providerInstanceId: "t3t-fx-bare-locked",
+		model: "cpa/claude-haiku-5-5",
+		options: { thinking: "medium" },
+	});
+});
+
+test("A1: a configured bare model with its own thinking and no override stays 'default'", async () => {
+	f.h.agent("fx-bare-own", "name: fx-bare-own\ndescription: Bare own\nmodel: claude-haiku-5-5\nthinking: low\nallowed-models: claude-sonnet-5-5\nsystem-prompt: replace");
+	f.sync();
+	expect(await target("fx-bare-own")).toEqual({ providerInstanceId: "t3t-fx-bare-own", model: "default", options: {} });
+	expect(await target("fx-bare-own", { model: "cpa/claude-sonnet-5-5" })).toEqual({
+		providerInstanceId: "t3t-fx-bare-own",
+		model: "cpa/claude-sonnet-5-5",
+		options: { thinking: "low" },
+	});
+});
+
+test("D23: exact retries reuse the first preparation; shell expansion runs once, also for concurrent retries", async () => {
+	const counter = join(f.cwd, "count.txt");
+	const seen = new Map<string, any>();
+	// Replay-aware bridge: a known clientRequestId returns the stored first launch (T3 behavior).
+	const bridge = new FakeBridge().respond(DELEGATE, (args) => {
+		if (!seen.has(args.clientRequestId)) seen.set(args.clientRequestId, { ...RUNNING, task: args.task });
+		return seen.get(args.clientRequestId);
+	});
+	const tool = f.tool();
+	const params = { ...base, agent: "fx-shell", task: "Run: !`echo x >> count.txt; wc -l < count.txt`" };
+	await Promise.all([f.run(tool, bridge, params, "call-r"), f.run(tool, bridge, params, "call-r")]);
+	await f.run(tool, bridge, params, "call-r");
+	expect(readFileSync(counter, "utf8")).toBe("x\n");
+	const tasks = new Set(bridge.calls.map((c) => c.args.task));
+	expect(bridge.calls).toHaveLength(3);
+	expect(tasks.size).toBe(1);
+	// A changed request is a new launch and expands again.
+	await f.run(tool, bridge, { ...params, title: "Other title" }, "call-r");
+	expect(readFileSync(counter, "utf8")).toBe("x\nx\n");
 });
 
 // --- D23: launch keys.
