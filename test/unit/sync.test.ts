@@ -1,14 +1,16 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import { createExtension } from "../../index.ts";
 import { c6SettingsShape, c7LaunchArgs } from "../../src/doctor-checks.ts";
 import { runSync } from "../../src/sync.ts";
-import { acquireLock, writeSettings } from "../../src/settings-writer.ts";
+import { acquireLock, breakStaleLock, writeSettings } from "../../src/settings-writer.ts";
 import { resetCopyRegistry } from "../../src/takeover.ts";
 import { FakePiHost } from "../harness/fake-pi.ts";
+import { DefaultPackageManager } from "@earendil-works/pi-coding-agent";
+import { tokenizeArgs } from "../../src/planner.ts";
 import { noUi, type TempHost, tempHost, yesUi } from "./sync-helpers.ts";
 
 const BIN = "/opt/test/bin/pi";
@@ -37,6 +39,8 @@ function mainEntry(h: TempHost, withExtension = true) {
 		config: { binaryPath: BIN, launchArgs: withExtension ? `--extension ${h.extensionPath}` : "" },
 	};
 }
+
+const lockFile = (h: TempHost) => join(h.root, "t3", ".settings.json.pi-t3-subagents.lock");
 
 const sync = (h: TempHost, args = "--yes", extra: Partial<Parameters<typeof runSync>[0]> = {}) =>
 	runSync({ args, env: h.env, extensionPath: h.extensionPath, ui: noUi, reloadWaitMs: 0, ...extra });
@@ -329,8 +333,59 @@ describe("review regressions", () => {
 		h.agent("positional", "flags: --no-approve hello");
 		h.writeSettings({ providerInstances: { pi: mainEntry(h) } });
 		const report = await sync(h);
-		expect(report.text).toContain('skip provider: flags: "--provider" needs "--model"');
+		expect(report.text).toContain('skip provider: launch arguments: "--provider" needs "--model"');
 		expect(report.text).toContain("skip positional: flags: a positional argument is not supported by T3");
+	});
+
+	test("--provider in flags is valid when the agent's model supplies --model (reviewer case)", async () => {
+		const h = host();
+		h.agent("sonnet", "model: claude-sonnet-5-5\nflags: --provider anthropic");
+		h.writeSettings({ providerInstances: { pi: mainEntry(h) } });
+		const report = await sync(h);
+		expect(report.plan?.skipped).toEqual([]);
+		const args: string = h.readSettings().providerInstances["pi-sonnet"].config.launchArgs;
+		expect(args).toContain("--model claude-sonnet-5-5");
+		expect(args.endsWith("--provider anthropic")).toBe(true);
+	});
+
+	test("raw flags must be long flags: T3 aliases -a, -e, -t are rejected; a value that starts with - is kept", async () => {
+		const h = host();
+		h.agent("alias-a", "flags: -a");
+		h.agent("alias-e", "flags: -e /x/ext.ts");
+		h.agent("alias-t", "flags: -t read");
+		h.agent("dashvalue", "flags: --append-system-prompt -x");
+		h.writeSettings({ providerInstances: { pi: mainEntry(h) } });
+		const report = await sync(h);
+		for (const [agent, flag] of [["alias-a", "-a"], ["alias-e", "-e"], ["alias-t", "-t"]])
+			expect(report.text).toContain(`skip ${agent}: flags: short flag "${flag}" is not supported; use the long form`);
+		const ids = Object.keys(h.readSettings().providerInstances).sort();
+		expect(ids).toEqual(["pi", "pi-dashvalue"]);
+		for (const t of tokenizeArgs(h.readSettings().providerInstances["pi-dashvalue"].config.launchArgs))
+			if (t.startsWith("-") && t !== "-x") expect(t.startsWith("--")).toBe(true);
+	});
+
+	test("no package is installed before confirmation: missing and other-version packages are reported, installer never runs", async () => {
+		const h = host();
+		const calls: string[] = [];
+		const proto = DefaultPackageManager.prototype as any;
+		const original = proto.installParsedSource;
+		proto.installParsedSource = async (parsed: any) => {
+			calls.push(String(parsed?.name ?? parsed?.repo ?? "?"));
+			throw new Error("installer blocked by test");
+		};
+		try {
+			writeFileSync(join(h.configDir, "settings.json"), JSON.stringify({ skills: [join(h.root, "extra-skills")], packages: ["npm:not-installed-pkg", "npm:foo@9.9.9"] }));
+			h.agent("leaf", "skills: tdd");
+			const original2 = h.writeSettings({ providerInstances: { pi: mainEntry(h) } });
+			const report = await sync(h, "");
+			expect(calls).toEqual([]);
+			expect(report.status).toBe("needs-yes");
+			expect(report.text).toContain("configured Pi package npm:not-installed-pkg is not installed");
+			expect(report.text).toContain("configured Pi package npm:foo@9.9.9 is not installed");
+			expect(h.settingsText()).toBe(original2);
+		} finally {
+			proto.installParsedSource = original;
+		}
 	});
 
 	test("--prune right after an agent is removed disables the instance and does not delete it", async () => {
@@ -476,27 +531,23 @@ describe("settings writer interleavings", () => {
 		expect(h.settingsText()).toBe('{"a":2}\n');
 	});
 
-	test("a stale lock is taken over, and the old holder's release does not delete the new holder's lock", async () => {
+	test("a live holder is never taken over, even when its lock is older than 60 s", async () => {
 		const h = host();
-		const { utimesSync } = await import("node:fs");
 		const a = await acquireLock(h.settingsPath);
 		const old = new Date(Date.now() - 61_000);
-		utimesSync(join(h.root, "t3", ".settings.json.pi-t3-subagents.lock"), old, old);
-		const b = await acquireLock(h.settingsPath, 500);
-		expect(a.owns()).toBe(false);
-		a.release();
-		expect(b.owns()).toBe(true);
+		utimesSync(lockFile(h), old, old);
 		await expect(acquireLock(h.settingsPath, 200)).rejects.toThrow("settings writer lock is busy");
+		expect(a.owns()).toBe(true);
+		a.release();
+		const b = await acquireLock(h.settingsPath, 200);
+		expect(b.owns()).toBe(true);
 		b.release();
-		const c = await acquireLock(h.settingsPath, 200);
-		c.release();
 	});
 
-	test("a writer whose lock was taken over does not commit", async () => {
+	test("a writer keeps its lock through the commit even when the lock ages past 60 s", async () => {
 		const h = host();
-		const { utimesSync } = await import("node:fs");
 		const text = h.writeSettings({ a: 1 });
-		let other: Awaited<ReturnType<typeof acquireLock>> | undefined;
+		let takeover: unknown;
 		const out = await writeSettings({
 			settingsPath: h.settingsPath,
 			stateDir: join(h.root, "state"),
@@ -507,15 +558,39 @@ describe("settings writer interleavings", () => {
 			hooks: {
 				beforeFinalCompare: async () => {
 					const old = new Date(Date.now() - 61_000);
-					utimesSync(join(h.root, "t3", ".settings.json.pi-t3-subagents.lock"), old, old);
-					other = await acquireLock(h.settingsPath, 500);
+					utimesSync(lockFile(h), old, old);
+					takeover = await acquireLock(h.settingsPath, 200).then(() => "acquired", (e: Error) => e.message);
 				},
 			},
 		});
-		expect(out.status).toBe("lock-lost");
-		expect(h.settingsText()).toBe(text);
-		expect(other?.owns()).toBe(true);
-		other?.release();
+		expect(takeover).toContain("settings writer lock is busy");
+		expect(out.status).toBe("written");
+		expect(h.settingsText()).toBe('{"a":2}\n');
+	});
+
+	test("a lock whose holder process is gone is taken over at once; another host's lock after 60 s", async () => {
+		const h = host();
+		const deadPid = Bun.spawnSync(["true"]).pid;
+		writeFileSync(lockFile(h), `${deadPid} ${hostname()} dead-token`);
+		const a = await acquireLock(h.settingsPath, 200);
+		a.release();
+		writeFileSync(lockFile(h), "123 some-other-host remote-token");
+		await expect(acquireLock(h.settingsPath, 200)).rejects.toThrow("held by process 123 on some-other-host");
+		const old = new Date(Date.now() - 61_000);
+		utimesSync(lockFile(h), old, old);
+		const b = await acquireLock(h.settingsPath, 200);
+		b.release();
+	});
+
+	test("breaking a stale lock puts back a lock that replaced it", () => {
+		const h = host();
+		const live = `${process.pid} ${hostname()} live-token`;
+		writeFileSync(lockFile(h), live);
+		breakStaleLock(lockFile(h), `999999 ${hostname()} dead-token`);
+		expect(readFileSync(lockFile(h), "utf8")).toBe(live);
+		expect(readdirSync(join(h.root, "t3")).filter((f) => f.includes("breaking"))).toEqual([]);
+		breakStaleLock(lockFile(h), live);
+		expect(readdirSync(join(h.root, "t3")).filter((f) => f.includes("lock"))).toEqual([]);
 	});
 
 	test("backups: mode 0600 in a 0700 folder, newest 10 kept", async () => {

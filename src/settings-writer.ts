@@ -8,7 +8,8 @@
  * erase this write. The second case is detected by `verify`.
  */
 import { randomUUID } from "node:crypto";
-import { chmodSync, closeSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { hostname } from "node:os";
 import { basename, dirname, join } from "node:path";
 
 export const LOCK_STALE_MS = 60_000;
@@ -67,9 +68,56 @@ export interface WriterLock {
 	release(): void;
 }
 
+/**
+ * Stale rule: a lock is taken over only when its holder cannot still be
+ * writing. On this host that means the holder process no longer exists (a
+ * live holder is never taken over, whatever the lock age, so it can never
+ * release or commit over a newer holder). A lock from another host, or one
+ * without a readable token, falls back to the age rule (older than 60 s).
+ */
+function isStale(text: string, mtimeMs: number): boolean {
+	const [pid, host] = text.split(" ");
+	if (host === hostname() && /^\d+$/.test(pid ?? "")) {
+		try {
+			process.kill(Number(pid), 0);
+			return false; // Holder process alive.
+		} catch (error) {
+			return (error as NodeJS.ErrnoException).code === "ESRCH";
+		}
+	}
+	return Date.now() - mtimeMs > LOCK_STALE_MS;
+}
+
+/**
+ * Break a stale lock without deleting a lock that replaced it: move it to a
+ * private name first (atomic), then check what was moved. If a new lock was
+ * moved by mistake, put it back; if that fails because a third lock exists,
+ * the moved holder sees the new token and refuses to commit (lock-lost).
+ */
+export function breakStaleLock(path: string, staleText: string): void {
+	const moved = `${path}.breaking-${randomUUID()}`;
+	try {
+		renameSync(path, moved);
+	} catch {
+		return; // Already gone.
+	}
+	let movedText = "";
+	try {
+		movedText = readFileSync(moved, "utf8");
+	} catch {}
+	if (movedText !== staleText) {
+		try {
+			linkSync(moved, path);
+		} catch {}
+	}
+	try {
+		unlinkSync(moved);
+	} catch {}
+}
+
 export async function acquireLock(settingsPath: string, waitMs = DEFAULT_LOCK_WAIT_MS): Promise<WriterLock> {
 	const path = lockPath(settingsPath);
-	const token = `${process.pid} ${randomUUID()}`;
+	const token = `${process.pid} ${hostname()} ${randomUUID()}`;
 	const owns = () => {
 		try {
 			return readFileSync(path, "utf8") === token;
@@ -86,7 +134,8 @@ export async function acquireLock(settingsPath: string, waitMs = DEFAULT_LOCK_WA
 			return {
 				owns,
 				release() {
-					if (!owns()) return; // Taken over after it went stale: never delete another writer's lock.
+					// Safe: a live holder's lock is never taken over, so the token cannot change under it.
+					if (!owns()) return;
 					try {
 						unlinkSync(path);
 					} catch {}
@@ -96,15 +145,25 @@ export async function acquireLock(settingsPath: string, waitMs = DEFAULT_LOCK_WA
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 		}
 		try {
-			if (Date.now() - statSync(path).mtimeMs > LOCK_STALE_MS) {
-				unlinkSync(path);
+			const text = readFileSync(path, "utf8");
+			if (isStale(text, statSync(path).mtimeMs)) {
+				breakStaleLock(path, text);
 				continue;
 			}
 		} catch {
-			continue; // Released between open and stat.
+			continue; // Released between open and read.
 		}
-		if (Date.now() > deadline) throw new Error(`settings writer lock is busy: ${path}`);
+		if (Date.now() > deadline) throw new Error(`settings writer lock is busy: ${path} (held by ${holderOf(path)})`);
 		await sleep(LOCK_POLL_MS);
+	}
+}
+
+function holderOf(path: string): string {
+	try {
+		const [pid, host] = readFileSync(path, "utf8").split(" ");
+		return `process ${pid} on ${host}`;
+	} catch {
+		return "unknown";
 	}
 }
 

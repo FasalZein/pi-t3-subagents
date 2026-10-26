@@ -27,6 +27,8 @@ export interface HostFacts {
 	readonly resolveSkill: (name: string) => string | undefined;
 	/** Installed path for an `npm:` or `git:` spec, or undefined (spec passes through). */
 	readonly resolvePackage: (spec: string) => string | undefined;
+	/** Host problems to show in the plan (for example a configured package that is not installed). */
+	readonly notices?: readonly string[];
 }
 
 export type InstancePlan =
@@ -117,7 +119,7 @@ const T3_FLAGS_WITHOUT_VALUES = new Set([
  * Problems that make T3 reject these launch arguments (the instance becomes
  * unavailable). Messages name flags only, never values.
  */
-export function t3LaunchArgProblems(tokens: readonly string[]): string[] {
+export function t3LaunchArgProblems(tokens: readonly string[], options: { complete: boolean } = { complete: true }): string[] {
 	const args = tokens.flatMap((arg) => {
 		const eq = arg.indexOf("=");
 		return eq > 0 && T3_FLAGS_WITH_VALUES.has(arg.slice(0, eq)) ? [arg.slice(0, eq), arg.slice(eq + 1)] : [arg];
@@ -152,7 +154,24 @@ export function t3LaunchArgProblems(tokens: readonly string[]): string[] {
 		if (arg.startsWith("-")) problems.push(`short flag "${arg}" is not supported by T3; use the long form`);
 		else problems.push("a positional argument is not supported by T3");
 	}
-	if (hasProvider && !hasModel) problems.push('"--provider" needs "--model"');
+	// Cross-argument rule: only meaningful for the complete list, not for a fragment such as raw `flags`.
+	if (options.complete && hasProvider && !hasModel) problems.push('"--provider" needs "--model"');
+	return problems;
+}
+
+/**
+ * The sync's own rule for raw `flags` (stricter than T3): long flags only.
+ * T3 accepts aliases such as `-a`, `-e` and `-t`; the sync rejects them so
+ * that every stored launch argument is a long flag. Values of known value
+ * flags are skipped, so a value that starts with "-" is not a flag.
+ */
+export function shortFlagProblems(tokens: readonly string[]): string[] {
+	const problems: string[] = [];
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i];
+		if (/^-[^-]/.test(token)) problems.push(`short flag "${token}" is not supported; use the long form`);
+		else if (T3_FLAGS_WITH_VALUES.has(token)) i++; // Skip the value of a long value flag.
+	}
 	return problems;
 }
 
@@ -363,7 +382,7 @@ function planOrThrow(agent: AgentDefinition, host: HostFacts, id: string): Insta
 			if (CREDENTIAL_FLAGS.has(flag))
 				throw new SkipAgent(`flags: "${flag}" carries a credential, and T3 stores launch arguments in plain settings; set the key in the agent env instead`);
 		}
-		const problems = t3LaunchArgProblems(tokens);
+		const problems = [...shortFlagProblems(tokens), ...t3LaunchArgProblems(tokens, { complete: false })];
 		if (problems.length > 0) throw new SkipAgent(`flags: ${problems[0]}`);
 		args.push(...tokens);
 	}

@@ -5,7 +5,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { DefaultPackageManager, DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { DefaultPackageManager, loadSkills, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { type AgentDefinition, agentConfigDir, agentsDir, readCatalog } from "./catalog.ts";
@@ -81,7 +81,7 @@ export function planSync(input: {
 		else if (input.prune) actions.push({ kind: "prune", id });
 	}
 
-	const warnings: string[] = [];
+	const warnings: string[] = [...(host.notices ?? [])];
 	const main = instances[mainId];
 	if (!main) warnings.push(`main instance "${mainId}" not found in T3 settings`);
 	else if (!loadsExtension(main, host.extensionPath))
@@ -158,27 +158,35 @@ export async function hostFacts(env: NodeJS.ProcessEnv, settings: Settings, exte
 		home,
 		resolveSkill: (name) => resources.skills.get(name),
 		resolvePackage: resources.resolvePackage,
+		notices: resources.notices,
 	};
 }
 
 /**
- * Pi's own resource view of the global configuration, as pi-subagents uses it:
- * the discovered skills (default folders, nested skill folders, configured
- * skill paths and package skills) by name, and the installed path of an
- * `npm:` or `git:` spec (versions and refs included). Global scope only:
- * the instance serves every project, so project resources do not count.
+ * Pi's own resource view of the global configuration, without side effects:
+ * - skills: Pi's package manager resolves the configured skill paths, the
+ *   default skill folders and package skills, then Pi's `loadSkills` parses
+ *   them (nested folders included). Name -> absolute SKILL.md path.
+ * - packages: the installed path of an `npm:` or `git:` spec (versions and refs included).
+ * Nothing is installed: a configured package that is missing or has another
+ * version is skipped and reported (Pi's resolve() would install it otherwise).
+ * Global scope only: the instance serves every project.
  */
 export async function piResources(
 	configDir: string,
 	cwd: string,
-): Promise<{ skills: Map<string, string>; resolvePackage: (spec: string) => string | undefined }> {
+): Promise<{ skills: Map<string, string>; resolvePackage: (spec: string) => string | undefined; notices: string[] }> {
 	const settingsManager = SettingsManager.create(cwd, configDir);
-	const loader = new DefaultResourceLoader({ cwd, agentDir: configDir, settingsManager, noExtensions: true });
-	await loader.reload();
-	const skills = new Map<string, string>();
-	for (const skill of loader.getSkills().skills) if (skill.sourceInfo?.scope !== "project") skills.set(skill.name, skill.filePath);
 	const packages = new DefaultPackageManager({ cwd, agentDir: configDir, settingsManager });
-	return { skills, resolvePackage: (spec) => packages.getInstalledPath(spec, "user") };
+	const notices: string[] = [];
+	const resolved = await packages.resolve(async (source) => {
+		notices.push(`configured Pi package ${source} is not installed (or has another version); its skills are not used. The sync does not install packages.`);
+		return "skip";
+	});
+	const skillPaths = resolved.skills.filter((r) => r.enabled && r.metadata.scope !== "project").map((r) => r.path);
+	const skills = new Map<string, string>();
+	for (const skill of loadSkills({ cwd, agentDir: configDir, skillPaths, includeDefaults: false }).skills) skills.set(skill.name, skill.filePath);
+	return { skills, resolvePackage: (spec) => packages.getInstalledPath(spec, "user"), notices };
 }
 
 function whichPi(): string {
