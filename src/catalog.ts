@@ -26,6 +26,8 @@ export interface AgentDefinition {
 export interface CatalogResult {
 	readonly agents: readonly AgentDefinition[];
 	readonly unreadable: readonly { path: string; reason: string }[];
+	/** Names of agents whose only files are disabled (for the launch error "disabled"). */
+	readonly disabled: readonly string[];
 }
 
 /** pi-subagents getAgentConfigDir(): PI_CODING_AGENT_DIR, else ~/.pi/agent. */
@@ -81,6 +83,41 @@ export function parseAgentFile(path: string): AgentDefinition | null {
 	};
 }
 
+/**
+ * Child runtime only (D24): the `env` entries of one agent file, values included.
+ * Same block rules as parseAgentFile. The result never leaves the child process.
+ */
+export function readAgentEnv(path: string): Array<[string, string]> {
+	const content = readFileSync(path, "utf8");
+	const match = content.match(/^---\n([\s\S]*?)\n---/);
+	if (!match) return [];
+	const lines = match[1].split(/\r?\n/);
+	for (let i = 0; i < lines.length; i++) {
+		const m = lines[i].match(FIELD_LINE);
+		if (!m || m[1] !== "env") continue;
+		const value = m[2].trim();
+		const block: string[] = [];
+		if (value === "|") {
+			for (let j = i + 1; j < lines.length; j++) {
+				if (lines[j].trim() && !/^[ \t]/.test(lines[j])) break;
+				block.push(lines[j].trim());
+			}
+		} else if (value) block.push(value);
+		const entries: Array<[string, string]> = [];
+		for (const line of block) {
+			const eq = line.indexOf("=");
+			if (eq > 0) entries.push([line.slice(0, eq).trim(), line.slice(eq + 1).trim()]);
+		}
+		return entries;
+	}
+	return [];
+}
+
+/** Agent file text without a leading frontmatter block (pi-subagents stripFrontmatter). */
+export function stripFrontmatter(text: string): string {
+	return text.replace(/^---\r?\n[\s\S]*?\r?\n---[ \t]*(\r?\n|$)/, "");
+}
+
 function envKeysOf(lines: string[]): string[] {
 	const keys: string[] = [];
 	for (const line of lines) {
@@ -96,8 +133,9 @@ function envKeysOf(lines: string[]): string[] {
  * enabled file wins. Only enabled agents are returned.
  */
 export function readCatalog(dir: string): CatalogResult {
-	if (!existsSync(dir)) return { agents: [], unreadable: [] };
+	if (!existsSync(dir)) return { agents: [], unreadable: [], disabled: [] };
 	const byName = new Map<string, AgentDefinition>();
+	const disabled = new Set<string>();
 	const unreadable: { path: string; reason: string }[] = [];
 	for (const file of readdirSync(dir)
 		.filter((f) => f.endsWith(".md"))
@@ -107,11 +145,16 @@ export function readCatalog(dir: string): CatalogResult {
 			const agent = parseAgentFile(path);
 			if (!agent) unreadable.push({ path, reason: "no frontmatter block" });
 			else if (agent.enabled) byName.set(agent.name, agent);
+			else disabled.add(agent.name);
 		} catch (error) {
 			unreadable.push({ path, reason: (error as Error).message });
 		}
 	}
-	return { agents: [...byName.values()].sort((a, b) => a.name.localeCompare(b.name)), unreadable };
+	return {
+		agents: [...byName.values()].sort((a, b) => a.name.localeCompare(b.name)),
+		unreadable,
+		disabled: [...disabled].filter((name) => !byName.has(name)),
+	};
 }
 
 /** D18: project agents live in `<cwd>/.pi/agents`; v1 does not support them. */

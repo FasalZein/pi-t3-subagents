@@ -239,6 +239,7 @@ Each slice in one wave changes a different module; the entry file only wires mod
 | enabled | Sync: D12. Parent: launch error. |
 | flags | Launch: appended last. A reserved T3 flag skips the agent with a report. |
 | cwd, deny-env, no-session, idle-timeout, on-timeout, parent-close-policy, llm-as-a-verifier fields | Gaps. |
+| (model API `openai-completions`) | Gap (owner decision 2026-10-26, U5): T3's bridge activates its whole tool catalog for a child whose model uses `openai-completions`, so that completion gateways do not drop calls to undeclared tools. `--exclude-tools` still removes the thread-starting tools from leaves. To narrow the active tools, the agent author sets a fixed `tools` list. The wrapper does not undo T3's activation. |
 
 The sync output lists gaps once per agent that uses them; the README lists all gaps.
 
@@ -385,7 +386,7 @@ Unverified facts, each closed by a slice acceptance check:
 | U2 | Named `mcp__t3-code__*` entries in `--tools` keep those bridge tools active in a child. | S5 |
 | U3 | A parent on a main instance can call the deferred `task_cancel` and `t3_thread_send`. | S6 |
 | U4 | `config.managedBy` and `config.namespace` survive a T3 UI settings edit. | S2 |
-| U5 | With `--no-extensions` plus built-in MCP and tool-search, a child does not get the whole bridge catalog as active tools. | S3 |
+| U5 | With `--no-extensions` plus built-in MCP and tool-search, a child does not get the whole bridge catalog as active tools. | S3: passed 2026-10-26 for every model API except `openai-completions` (live: 2 active bridge tools on cpa/claude-haiku-5-5; 76 on zai/glm-5.3-flash). The `openai-completions` case is a documented gap (field mapping). |
 | U6 | Frontmatter removal before the run reaches the model request. | S3 |
 | U7 | The raw input event can remove the header from the first prompt that T3 sends. | S3 |
 | U8 | The parent's raw input event sees wakes, including steered and batched wakes. | S4 |
@@ -509,7 +510,7 @@ Delivers: interactive fixtures with `auto-exit: false` run as child threads that
 
 Blocked by: S4, S5, S6, S7, S8.
 
-Delivers: a README for any pi-subagents user (purpose, setup on a main instance, sync, field mapping with gaps, lifecycle with T3 tools, caller ping, supervised behavior, the settings-write risk, compatibility contracts and the doctor, update advice), an updated header comment in the entry file, and a doctor that covers C1 to C10.
+Delivers: a README for any pi-subagents user (purpose, setup on a main instance, sync, field mapping with gaps (including the `openai-completions` whole-catalog gap from U5), lifecycle with T3 tools, caller ping, supervised behavior, the settings-write risk, compatibility contracts and the doctor, update advice), an updated header comment in the entry file, and a doctor that covers C1 to C10.
 
 - [ ] Live (`t3e2e-s9-`): in `approval-required` mode one launch shows the approvals that the README describes, and the child inherits the mode (U1).
 - [ ] Live: a worker follows the README from a fresh namespace main instance without the extension and gets a working leaf launch.

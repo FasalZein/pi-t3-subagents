@@ -281,7 +281,7 @@ describe("repository fixture agents", () => {
 		expect(report.status).toBe("written");
 		expect(report.plan?.skipped).toEqual([]);
 		const ids = Object.keys(h.readSettings().providerInstances).sort();
-		expect(ids).toEqual(["t3e2e-s2-fx-env", "t3e2e-s2-fx-interactive", "t3e2e-s2-fx-leaf", "t3e2e-s2-fx-spawner", "t3e2e-s2-fx-sync", "t3e2e-s2-main"]);
+		expect(ids).toEqual(["t3e2e-s2-fx-env", "t3e2e-s2-fx-ext", "t3e2e-s2-fx-interactive", "t3e2e-s2-fx-leaf", "t3e2e-s2-fx-spawner", "t3e2e-s2-fx-sync", "t3e2e-s2-main"]);
 		expect(h.settingsText()).not.toContain("fixture-dummy-secret-0000");
 		expect(report.text).toContain("gap fx-env: env: PI_OFFLINE");
 	});
