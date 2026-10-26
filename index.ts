@@ -36,6 +36,7 @@ import { installChildTools } from "./src/child-tools.ts";
 import { installLedger, wakeFormatCheck } from "./src/ledger.ts";
 import { ledgerOf } from "./src/subagent-tool.ts";
 import { installCallerPing } from "./src/caller-ping.ts";
+import { runLimitsInstaller } from "./src/run-limits.ts";
 
 type Env = Record<string, string | undefined>;
 
@@ -79,6 +80,11 @@ export function createExtension(env: Env = process.env, copyId: string = import.
 			installCallerPing,
 			// [slot S6] end
 			// [slot S7] context warnings and time limit: begin
+			// Thresholds come from the current agent file, read again at the start of each run.
+			runLimitsInstaller((managed) => {
+				const name = managed.state()?.agent;
+				return readCatalog(agentsDir(env as NodeJS.ProcessEnv)).agents.find((a) => a.name === name);
+			}),
 			// [slot S7] end
 		]);
 		// [slot S8] interactive agents: begin
