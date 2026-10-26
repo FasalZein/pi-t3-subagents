@@ -262,6 +262,22 @@ describe("ownership and namespaces", () => {
 	});
 });
 
+describe("repository fixture agents", () => {
+	test("the live-test fixtures plan without a skip in a namespace and keep their dummy secret out", async () => {
+		const h = host("t3e2e-s2-");
+		const fixtures = join(import.meta.dir, "fixtures", "agents");
+		const env = { ...h.env, PI_T3_AGENTS_DIR: fixtures };
+		h.writeSettings({ providerInstances: { "t3e2e-s2-main": mainEntry(h) } });
+		const report = await runSync({ args: "--yes", env, extensionPath: h.extensionPath, ui: noUi, reloadWaitMs: 0 });
+		expect(report.status).toBe("written");
+		expect(report.plan?.skipped).toEqual([]);
+		const ids = Object.keys(h.readSettings().providerInstances).sort();
+		expect(ids).toEqual(["t3e2e-s2-fx-env", "t3e2e-s2-fx-interactive", "t3e2e-s2-fx-leaf", "t3e2e-s2-fx-spawner", "t3e2e-s2-fx-sync", "t3e2e-s2-main"]);
+		expect(h.settingsText()).not.toContain("fixture-dummy-secret-0000");
+		expect(report.text).toContain("gap fx-env: env: PI_OFFLINE");
+	});
+});
+
 describe("skips", () => {
 	test("invalid names, unknown skills, reserved and short flags skip the agent with a reason", async () => {
 		const h = host();
