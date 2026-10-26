@@ -16,6 +16,7 @@ import {
 	BRIDGE_DELEGATE,
 	type Caller,
 	type DelegateArgs,
+	isInteractive,
 	itemText,
 	type LaunchItem,
 	LaunchError,
@@ -223,22 +224,24 @@ export function createSubagentTool(deps: SubagentToolDeps): ToolDefinition<typeo
 		name: "subagent",
 		label: "Subagent (T3)",
 		description:
-			"Launch an agent from the agent roster as a T3 Code child thread (through delegate_task). Completion wakes this thread, so end your turn after an async launch. Stop with task_cancel, continue with t3_thread_send, read with task_status (reading suppresses the wake).",
+			"Launch an agent from the agent roster as a T3 Code child thread (through delegate_task). Completion wakes this thread, so end your turn after an async launch. Stop with mcp__t3-code__task_cancel, continue with mcp__t3-code__t3_thread_send, read with mcp__t3-code__task_status (reading suppresses the wake); in codemode they are tools.mcp__t3_code__task_cancel, tools.mcp__t3_code__t3_thread_send and tools.mcp__t3_code__task_status.",
 		parameters: SubagentParams,
 		annotations: { destructiveHint: true, openWorldHint: true, readOnlyHint: false },
 		// Every call reaches the T3 bridge tool; the word matches mcp__t3-code__delegate_task.
 		reachesTools: () => ["delegate_task"],
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const at = new Date().toISOString();
-			let reservations: string[] = [];
+			let reserved: string[] = [];
 			try {
 				const batch = params.children !== undefined && params.children.length > 0;
 				if (batch && (params.task !== undefined || params.agent !== undefined))
 					throw new LaunchError("subagent launch refused: pass either children[] or one launch (agent, task), not both.");
 				const children: LaunchParamsInput[] = batch ? params.children! : [params];
-				// Step 2: reserve the whole batch before the first await, so parallel calls cannot exceed the width.
+				const keys = children.map((child, index) => launchKey(toolCallId, index, child));
+				// Step 2: reserve the whole batch before the first await, so parallel calls cannot exceed
+				// the width. An exact retry of a launched key reserves nothing: T3 replays that child.
 				try {
-					reservations = ledger.reserve(children.length);
+					reserved = ledger.reserveLaunches(keys);
 				} catch (error) {
 					throw new LaunchError(`subagent launch refused: ${(error as Error).message}`);
 				}
@@ -259,7 +262,7 @@ export function createSubagentTool(deps: SubagentToolDeps): ToolDefinition<typeo
 				const start = (index: number) =>
 					startLaunch(launches[index]!, send).then((item) => {
 						items[index] = item;
-						ledger.settle(reservations[index]!, { taskId: item.taskId, childThreadId: item.childThreadId, status: item.status });
+						ledger.settleLaunch(keys[index]!, { taskId: item.taskId, childThreadId: item.childThreadId, status: item.status });
 					});
 				// Step 5: array order; async children are awaited one by one, synchronous ones run concurrently.
 				for (let index = 0; index < launches.length && !failure; index++) {
@@ -275,7 +278,7 @@ export function createSubagentTool(deps: SubagentToolDeps): ToolDefinition<typeo
 				}
 				await Promise.all(waits);
 				// Step 6: reservations of children that did not start are released.
-				for (let index = 0; index < launches.length; index++) if (!items[index]) ledger.release(reservations[index]!);
+				for (let index = 0; index < launches.length; index++) if (!items[index] && reserved.includes(keys[index]!)) ledger.releaseLaunch(keys[index]!);
 				if (failure) {
 					if (failure.error instanceof LaunchError && /^delegate_task failed/.test(failure.error.message)) bridgeFailed = true;
 					throw Object.assign(new LaunchError(batchError(launches, items, failure)), { bridge: bridgeFailed });
@@ -284,14 +287,14 @@ export function createSubagentTool(deps: SubagentToolDeps): ToolDefinition<typeo
 				deps.onOutcome?.({ ok: true, at, items: done });
 				const notice = ledger.snapshot().enforcing ? [] : [FAIL_OPEN_NOTICE];
 				return {
-					content: [{ type: "text" as const, text: [...done.map(itemText), ...notice].join("\n\n") }],
+					content: [{ type: "text" as const, text: [...done.map((item, index) => textFor(item, launches[index]!)), ...notice].join("\n\n") }],
 					structuredContent: { launches: done.map((item) => ({ ...item })) },
 					// Never details.results: T3 would draw a second, native subagent card.
 					details: undefined,
 				};
 			} catch (error) {
 				// A refusal before the bridge releases every reservation (idempotent after step 6).
-				for (const reservation of reservations) ledger.release(reservation);
+				for (const key of reserved) ledger.releaseLaunch(key);
 				deps.onOutcome?.({ ok: false, at, error: (error as Error).message, bridge: (error as any).bridge === true });
 				throw error;
 			}
@@ -305,15 +308,19 @@ export function createSubagentTool(deps: SubagentToolDeps): ToolDefinition<typeo
 function batchError(launches: readonly PreparedLaunch[], items: ReadonlyArray<LaunchItem | undefined>, failure: { index: number; error: Error }): string {
 	const failed = launches[failure.index]!;
 	if (launches.length === 1) return failure.error.message;
-	const started = items.filter((item): item is LaunchItem => item !== undefined);
+	const started = launches.flatMap((launch, index) => (items[index] ? [textFor(items[index]!, launch)] : []));
 	const notSent = launches.filter((launch, index) => index > failure.index && !items[index] && launch.args.mode === "async");
 	return [
 		`subagent batch: child ${failure.index + 1} '${failed.name}' (agent ${failed.agent.name}) failed: ${failure.error.message}`,
-		started.length > 0
-			? `Started children keep running: ${started.map((i) => `${i.name} taskId=${i.taskId} childThreadId=${i.childThreadId} state=${i.state}`).join("; ")}. Stop them with task_cancel or wait for their wakes.`
-			: "No child started.",
+		// Each started child keeps its own result text: a finished reply inline (no wake), else its live state.
+		started.length > 0 ? `Started children:\n\n${started.join("\n\n")}` : "No child started.",
 		...(notSent.length > 0 ? [`Not sent: ${notSent.map((l) => l.name).join(", ")}.`] : []),
-	].join("\n");
+	].join("\n\n");
+}
+
+/** Result text of one child; interactive agents get the owner's answer-in-the-child-thread guidance. */
+function textFor(item: LaunchItem, launch: PreparedLaunch): string {
+	return itemText(item, { interactive: isInteractive(launch.agent) });
 }
 
 const toolLedgers = new WeakMap<object, Ledger>();

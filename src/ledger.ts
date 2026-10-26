@@ -82,7 +82,8 @@ export interface LiveTask {
 export interface LedgerSnapshot {
 	readonly live: readonly LiveTask[];
 	readonly reserved: number;
-	readonly limit: number;
+	/** Width, or the error text of a malformed configured width. */
+	readonly limit: number | string;
 	readonly enforcing: boolean;
 	readonly failOpenReason: string | null;
 }
@@ -106,19 +107,47 @@ export function bridgeData(event: { structuredContent?: any; content?: unknown }
 
 export class Ledger {
 	private readonly live = new Map<string, LiveTask>();
-	private readonly reservations = new Set<string>();
+	/** Open reservations: id -> the launch key it serves (sends have none). */
+	private readonly reservations = new Map<string, string | undefined>();
+	/** Launch key -> its open reservation (a concurrent exact retry shares it). */
+	private readonly keyReservations = new Map<string, string>();
+	/** Launch keys that reached T3: an exact retry gets T3's replay, never a new child (D23). */
+	private readonly launchedKeys = new Set<string>();
+	/**
+	 * Task ids seen in a terminal state (final response, wake, cancel, final status or read).
+	 * Terminal is monotonic: a late non-final response cannot make such a task live again.
+	 */
+	private readonly ended = new Set<string>();
 	/** Child threads launched by this process: t3_thread_send to them counts toward width. */
 	private readonly threads = new Set<string>();
 	/** t3_thread_send tool call id -> its reservation. */
 	private readonly sends = new Map<string, string>();
+	/** t3_thread_read tool call id -> the live tasks of that thread when the read started. */
+	private readonly reads = new Map<string, string[]>();
 	private nextId = 1;
 	private failOpen: string | null = null;
 
 	constructor(private readonly limit: () => number) {}
 
-	/** Width limit of this caller, at most MAX_SPAWN_WIDTH. */
+	/** Width limit of this caller, at most MAX_SPAWN_WIDTH. Throws when the configured width is malformed. */
 	width(): number {
 		return Math.min(Math.max(0, this.limit()), MAX_SPAWN_WIDTH);
+	}
+
+	private check(count: number): void {
+		const width = this.width();
+		const used = this.live.size + this.reservations.size;
+		if (this.failOpen === null && count > 0 && used + count > width)
+			throw new WidthFullError(
+				`spawn width is full: ${this.live.size} live and ${this.reservations.size} reserved children, ${count} new, width ${width}. Wait for a wake, or stop a child with task_cancel (${TASK_CANCEL}).`,
+			);
+	}
+
+	private open(key?: string): string {
+		const id = `r${this.nextId++}`;
+		this.reservations.set(id, key);
+		if (key !== undefined) this.keyReservations.set(key, id);
+		return id;
 	}
 
 	/**
@@ -126,41 +155,71 @@ export class Ledger {
 	 * After a fail-open the reservation always succeeds.
 	 */
 	reserve(count: number): string[] {
-		const width = this.width();
-		const used = this.live.size + this.reservations.size;
-		if (this.failOpen === null && used + count > width)
-			throw new WidthFullError(
-				`spawn width is full: ${this.live.size} live and ${this.reservations.size} reserved children, ${count} new, width ${width}. Wait for a wake, or stop a child with task_cancel.`,
-			);
-		const ids: string[] = [];
-		for (let i = 0; i < count; i++) {
-			const id = `r${this.nextId++}`;
-			this.reservations.add(id);
-			ids.push(id);
-		}
-		return ids;
+		this.check(count);
+		return Array.from({ length: count }, () => this.open());
+	}
+
+	/**
+	 * Reserve one slot per launch key, synchronously, for the keys that need one. A key that already
+	 * reached T3, or has an open reservation, needs none: T3 replays it without a new child (D23).
+	 * Returns the keys this call reserved; throws when they do not fit.
+	 */
+	reserveLaunches(keys: readonly string[]): string[] {
+		const fresh = [...new Set(keys)].filter((key) => !this.launchedKeys.has(key) && !this.keyReservations.has(key));
+		this.check(fresh.length);
+		for (const key of fresh) this.open(key);
+		return fresh;
 	}
 
 	release(reservation: string): void {
-		this.reservations.delete(reservation);
-	}
-
-	/** A launch or send response: a non-final status makes the reservation a live task; a final one releases it. */
-	settle(reservation: string, task: { taskId: string; childThreadId: string; status: string }): void {
+		const key = this.reservations.get(reservation);
 		if (!this.reservations.delete(reservation)) return;
-		this.threads.add(task.childThreadId);
-		if (!FINAL_TASK_STATUSES.has(task.status)) this.live.set(task.taskId, { taskId: task.taskId, childThreadId: task.childThreadId });
+		if (key !== undefined && this.keyReservations.get(key) === reservation) this.keyReservations.delete(key);
 	}
 
-	remove(taskId: string): void {
+	/** Release the open reservation of a launch key (the launch did not reach T3). */
+	releaseLaunch(key: string): void {
+		const reservation = this.keyReservations.get(key);
+		if (reservation !== undefined) this.release(reservation);
+	}
+
+	/** A task observed terminal: never live again. */
+	end(taskId: string): void {
 		this.live.delete(taskId);
+		this.ended.add(taskId);
+	}
+
+	private record(task: { taskId: string; childThreadId: string; status: string }): void {
+		this.threads.add(task.childThreadId);
+		if (FINAL_TASK_STATUSES.has(task.status)) this.end(task.taskId);
+		else if (!this.ended.has(task.taskId)) this.live.set(task.taskId, { taskId: task.taskId, childThreadId: task.childThreadId });
+	}
+
+	/** A send response: a non-final status makes the reservation a live task; a final one releases it. */
+	settle(reservation: string, task: { taskId: string; childThreadId: string; status: string }): void {
+		if (!this.reservations.has(reservation)) return;
+		this.release(reservation);
+		this.record(task);
+	}
+
+	/** A launch response for `key` (also an exact retry's replay): the task is live unless terminal. */
+	settleLaunch(key: string, task: { taskId: string; childThreadId: string; status: string }): void {
+		this.releaseLaunch(key);
+		this.launchedKeys.add(key);
+		this.record(task);
 	}
 
 	snapshot(): LedgerSnapshot {
-		return { live: [...this.live.values()], reserved: this.reservations.size, limit: this.width(), enforcing: this.failOpen === null, failOpenReason: this.failOpen };
+		let limit: number | string;
+		try {
+			limit = this.width();
+		} catch (error) {
+			limit = (error as Error).message;
+		}
+		return { live: [...this.live.values()], reserved: this.reservations.size, limit, enforcing: this.failOpen === null, failOpenReason: this.failOpen };
 	}
 
-	/** Raw input: remove every task a wake reports. Returns the fail-open notice when the wake is unreadable (first time only). */
+	/** Raw input: end every task a wake reports. Returns the fail-open notice when the wake is unreadable (first time only). */
 	observeInput(text: string): string | undefined {
 		const parsed = parseWake(text);
 		if (!parsed.wake) return undefined;
@@ -169,16 +228,22 @@ export class Ledger {
 			this.failOpen = `unreadable wake at ${new Date().toISOString()}: ${JSON.stringify(text.slice(0, 120))}`;
 			return FAIL_OPEN_NOTICE;
 		}
-		for (const id of parsed.taskIds) this.live.delete(id);
+		for (const id of parsed.taskIds) this.end(id);
 		return undefined;
 	}
 
-	/** tool_call of t3_thread_send to a known child thread: reserve one slot, or return the block reason. */
-	observeSendCall(event: { toolName: string; toolCallId: string; input?: any }): string | undefined {
-		if (event.toolName !== THREAD_SEND) return undefined;
+	/**
+	 * tool_call: t3_thread_send to a known child thread reserves one slot, or returns the block
+	 * reason; t3_thread_read records the thread's live tasks, so its result ends only those.
+	 */
+	observeCall(event: { toolName: string; toolCallId: string; input?: any }): string | undefined {
 		const threadId = event.input?.threadId;
-		if (typeof threadId !== "string" || !this.threads.has(threadId)) return undefined;
-		if (this.sends.has(event.toolCallId)) return undefined;
+		if (typeof threadId !== "string") return undefined;
+		if (event.toolName === THREAD_READ) {
+			this.reads.set(event.toolCallId, [...this.live.values()].filter((t) => t.childThreadId === threadId).map((t) => t.taskId));
+			return undefined;
+		}
+		if (event.toolName !== THREAD_SEND || !this.threads.has(threadId) || this.sends.has(event.toolCallId)) return undefined;
 		try {
 			const [reservation] = this.reserve(1);
 			this.sends.set(event.toolCallId, reservation!);
@@ -190,6 +255,7 @@ export class Ledger {
 
 	/** End of any tool call: a t3_thread_send reservation still open (blocked, aborted) is released. */
 	endCall(event: { toolCallId: string }): void {
+		this.reads.delete(event.toolCallId);
 		const reservation = this.sends.get(event.toolCallId);
 		if (reservation === undefined) return;
 		this.sends.delete(event.toolCallId);
@@ -212,31 +278,38 @@ export class Ledger {
 			case TASK_CANCEL: {
 				// Any status: T3 disposes the automatic delivery, so no wake comes.
 				const taskId = data?.taskId ?? event.input?.taskId;
-				if (data && typeof taskId === "string") this.live.delete(taskId);
+				if (data && typeof taskId === "string") this.end(taskId);
 				return;
 			}
 			case TASK_STATUS: {
 				const taskId = data?.taskId ?? event.input?.taskId;
-				if (typeof taskId === "string" && FINAL_TASK_STATUSES.has(String(data?.status))) this.live.delete(taskId);
+				if (typeof taskId === "string" && FINAL_TASK_STATUSES.has(String(data?.status))) this.end(taskId);
 				return;
 			}
 			case THREAD_READ: {
-				// Reading a child's final result marks it read and suppresses the wake (T3 facts).
-				const threadId = event.input?.threadId;
+				// Reading a child's final result marks it read and suppresses the wake (T3 facts). Only
+				// the tasks live when the read started: a continuation sent meanwhile is a newer run.
+				const seen = this.reads.get(event.toolCallId) ?? [];
+				this.reads.delete(event.toolCallId);
 				const status = data?.status ?? data?.thread?.status;
-				if (typeof threadId !== "string" || !FINAL_TASK_STATUSES.has(String(status))) return;
-				for (const task of [...this.live.values()]) if (task.childThreadId === threadId) this.live.delete(task.taskId);
+				if (!FINAL_TASK_STATUSES.has(String(status))) return;
+				for (const taskId of seen) this.end(taskId);
 				return;
 			}
 		}
 	}
 }
 
-/** Width limit for a caller: root 16 (A15); an agent its own `spawn-width`, at most 16. */
+/**
+ * Width limit for a caller: root 16 (A15); an agent its own `spawn-width`, at most 16. A present
+ * value must be a positive safe integer, as in pi-subagents (D4); otherwise the launch is refused.
+ */
 export function widthFor(callerAgent: string | null, spawnWidth: string | undefined): number {
-	if (callerAgent === null) return MAX_SPAWN_WIDTH;
-	const parsed = spawnWidth !== undefined && /^\d+$/.test(spawnWidth.trim()) ? Number(spawnWidth.trim()) : MAX_SPAWN_WIDTH;
-	return Math.min(parsed, MAX_SPAWN_WIDTH);
+	if (callerAgent === null || spawnWidth === undefined) return MAX_SPAWN_WIDTH;
+	const raw = spawnWidth.trim();
+	if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw)) || Number(raw) <= 0)
+		throw new Error(`agent '${callerAgent}' has spawn-width ${JSON.stringify(spawnWidth)}; spawn-width must be a positive safe integer greater than 0. Fix the agent file.`);
+	return Math.min(Number(raw), MAX_SPAWN_WIDTH);
 }
 
 /**
@@ -251,7 +324,7 @@ export function installLedger(pi: { on(event: string, handler: (event: any, ctx:
 		return undefined;
 	});
 	pi.on("tool_call", (event) => {
-		const reason = ledger.observeSendCall(event);
+		const reason = ledger.observeCall(event);
 		return reason ? { block: true, reason } : undefined;
 	});
 	pi.on("tool_result", (event) => {

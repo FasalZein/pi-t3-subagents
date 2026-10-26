@@ -8,7 +8,7 @@ import { rmSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { launchKey } from "../../src/launch-planner.ts";
-import { FAIL_OPEN_NOTICE, installLedger, Ledger, parseWake, TASK_CANCEL, TASK_STATUS, THREAD_READ, THREAD_SEND, wakeFormatCheck } from "../../src/ledger.ts";
+import { FAIL_OPEN_NOTICE, installLedger, Ledger, MAX_SPAWN_WIDTH, parseWake, TASK_CANCEL, TASK_STATUS, THREAD_READ, THREAD_SEND, wakeFormatCheck, widthFor } from "../../src/ledger.ts";
 import { createSubagentTool, type LaunchOutcome } from "../../src/subagent-tool.ts";
 import { FakeBridge } from "../harness/fake-bridge.ts";
 import { FakePiHost } from "../harness/fake-pi.ts";
@@ -20,6 +20,7 @@ beforeEach(() => {
 	f = launchFixture();
 	f.h.agent("fx-leaf", "name: fx-leaf\ndescription: Leaf\nmodel: cpa/claude-haiku-5-5\nthinking: low\nsystem-prompt: replace");
 	f.h.agent("fx-sync", "name: fx-sync\ndescription: Sync\nmodel: cpa/claude-haiku-5-5\nthinking: low\nasync: false\ntimeout: 120\nsystem-prompt: replace");
+	f.h.agent("fx-ask", "name: fx-ask\ndescription: Interactive\nmodel: cpa/claude-haiku-5-5\nthinking: low\nmode: interactive\nauto-exit: false\nsystem-prompt: replace");
 	f.sync();
 });
 afterEach(() => f.h.cleanup());
@@ -118,7 +119,8 @@ test("batch: the bridge fails the second of three; the first stays started, the 
 	const error = await f.run(toolWith(ledger, outcomes), bridge, { children: [child("fx-c1"), child("fx-c2"), child("fx-c3")] }).catch((e) => e);
 	expect(error.message).toContain("child 2 'fx-c2' (agent fx-leaf) failed");
 	expect(error.message).toContain("provider_unavailable");
-	expect(error.message).toContain("fx-c1 taskId=task-1 childThreadId=thread-1");
+	expect(error.message).toContain("fx-c1 (fx-leaf): taskId=task-1 childThreadId=thread-1");
+	expect(error.message).toContain("Completion wakes this thread");
 	expect(error.message).toContain("Not sent: fx-c3.");
 	expect(bridge.calls.map((c) => c.args.title)).toEqual(["Title fx-c1", "Title fx-c2"]);
 	expect(ledger.snapshot()).toMatchObject({ reserved: 0, live: [{ taskId: "task-1", childThreadId: "thread-1" }] });
@@ -343,4 +345,128 @@ test("ledger: a send reservation is released when another handler blocks the cal
 	const out = await call(host, THREAD_SEND, { threadId: "th1", message: "more" });
 	expect(out.blocked).toBe("guard");
 	expect(ledger.snapshot()).toMatchObject({ reserved: 0, live: [] });
+});
+
+// --- Review fixes (slice review of 9d2efa9).
+
+test("review F1: a final response for a task that is already live ends it (terminal replay)", () => {
+	const ledger = width(2);
+	const [first] = ledger.reserve(1);
+	ledger.settle(first!, { taskId: "same", childThreadId: "child", status: "running" });
+	const [again] = ledger.reserve(1);
+	ledger.settle(again!, { taskId: "same", childThreadId: "child", status: "completed" });
+	expect(ledger.snapshot()).toMatchObject({ live: [], reserved: 0 });
+});
+
+test("review F1: a wake or a cancel before the delayed running response keeps the task ended", async () => {
+	const ledger = width(2);
+	const [a, b] = ledger.reserve(2);
+	ledger.observeInput("Delegated task fast [completed]:\nreply");
+	ledger.settle(a!, { taskId: "fast", childThreadId: "fast-child", status: "running" });
+	const host = await ledgerHost(ledger, new FakeBridge().respond(TASK_CANCEL, (x) => ({ taskId: x.taskId, status: "cancel_requested" })));
+	await call(host, TASK_CANCEL, { taskId: "slow" });
+	ledger.settle(b!, { taskId: "slow", childThreadId: "slow-child", status: "running" });
+	expect(ledger.snapshot()).toMatchObject({ live: [], reserved: 0 });
+});
+
+test("review F2: a delayed terminal t3_thread_read does not remove a continuation sent during the read", async () => {
+	const ledger = width(1);
+	const [old] = ledger.reserve(1);
+	ledger.settle(old!, { taskId: "old", childThreadId: "child", status: "completed" });
+	let entered!: () => void;
+	let release!: () => void;
+	const inRead = new Promise<void>((r) => (entered = r));
+	const gate = new Promise<void>((r) => (release = r));
+	const bridge = new FakeBridge()
+		.respond(THREAD_READ, async () => {
+			entered();
+			await gate;
+			return { thread: { status: "completed" }, items: [] };
+		})
+		.respond(THREAD_SEND, () => ({ threadId: "child", taskId: "new", status: "running", delivery: "started" }));
+	const host = await ledgerHost(ledger, bridge);
+	const read = call(host, THREAD_READ, { threadId: "child" });
+	await inRead;
+	await call(host, THREAD_SEND, { threadId: "child", message: "continue" });
+	release();
+	await read;
+	expect(liveIds(ledger)).toEqual(["new"]);
+	expect(() => ledger.reserve(1)).toThrow(/spawn width is full/);
+});
+
+test("review F3: an exact retry at full width reaches T3 (replay) and charges no second slot; a changed request is refused", async () => {
+	const ledger = width(1);
+	const tool = toolWith(ledger);
+	const bridge = bridgeFor(() => delegateResult(1));
+	const params = child("fx-c1");
+	await f.run(tool, bridge, params, "same-call");
+	const retry = await f.run(tool, bridge, params, "same-call");
+	expect(retry.structuredContent.launches[0].taskId).toBe("task-1");
+	expect(bridge.calls.map((c) => c.args.clientRequestId)).toEqual([launchKey("same-call", 0, params), launchKey("same-call", 0, params)]);
+	expect(ledger.snapshot()).toMatchObject({ reserved: 0, live: [{ taskId: "task-1" }] });
+	await expect(f.run(tool, bridge, { ...params, task: "Say ok twice." }, "same-call")).rejects.toThrow(/spawn width is full/);
+	expect(bridge.calls).toHaveLength(2);
+});
+
+test("review F3: retrying a full-width batch after a mid-batch failure reserves only the child that did not start", async () => {
+	const ledger = width(2);
+	const tool = toolWith(ledger);
+	let fail = true;
+	const bridge = bridgeFor((a) => (numberOf(a) === 2 && fail ? { __mcpError: "provider_unavailable" } : delegateResult(numberOf(a))));
+	const children = [child("fx-c1"), child("fx-c2")];
+	await expect(f.run(tool, bridge, { children }, "batch-call")).rejects.toThrow(/child 2 'fx-c2'/);
+	fail = false;
+	const result = await f.run(tool, bridge, { children }, "batch-call");
+	expect(result.structuredContent.launches.map((i: any) => i.taskId)).toEqual(["task-1", "task-2"]);
+	expect(liveIds(ledger).sort()).toEqual(["task-1", "task-2"]);
+});
+
+test("review F4: a partial failure keeps a finished child's reply inline and does not promise its wake", async () => {
+	const bridge = bridgeFor((a) =>
+		numberOf(a) === 1 ? delegateResult(1, { status: "completed", summary: "IMPORTANT-INLINE-REPLY" }) : numberOf(a) === 2 ? delegateResult(2) : { __mcpError: "provider_unavailable" },
+	);
+	const children = [child("fx-c1", "fx-sync"), child("fx-c2"), child("fx-c3")];
+	const error = await f.run(toolWith(width(16)), bridge, { children }).catch((e) => e);
+	const [, finished, running] = error.message.split(/\n\n(?=fx-c\d \()/);
+	expect(finished).toContain("IMPORTANT-INLINE-REPLY");
+	expect(finished).toContain("no wake will come");
+	expect(finished).not.toContain("Completion wakes");
+	expect(running).toContain("taskId=task-2");
+	expect(running).toContain("Completion wakes this thread");
+});
+
+test("review F5: a malformed spawn-width is refused; absent or root gives 16; oversized is capped at 16", async () => {
+	for (const bad of ["two", "-1", "2.5", "0", ""]) expect(() => widthFor("fx-spawner", bad)).toThrow(/spawn-width must be a positive safe integer/);
+	expect(widthFor("fx-spawner", undefined)).toBe(MAX_SPAWN_WIDTH);
+	expect(widthFor(null, "two")).toBe(MAX_SPAWN_WIDTH);
+	expect(widthFor("fx-spawner", "99")).toBe(MAX_SPAWN_WIDTH);
+	expect(widthFor("fx-spawner", "3")).toBe(3);
+	const bridge = bridgeFor((a) => delegateResult(numberOf(a)));
+	const tool = toolWith(new Ledger(() => widthFor("fx-spawner", "two")));
+	await expect(f.run(tool, bridge, child("fx-c1"))).rejects.toThrow(/subagent launch refused: agent 'fx-spawner' has spawn-width "two"/);
+	expect(bridge.calls).toEqual([]);
+});
+
+test("review F6: lifecycle guidance names the public bridge tools and their codemode spellings; ledger events keep the public names", async () => {
+	const result = await f.run(toolWith(width(16)), bridgeFor((a) => delegateResult(numberOf(a))), child("fx-c1"));
+	const text = result.content[0].text;
+	expect(text).toContain('mcp__t3-code__task_cancel {"taskId":"task-1"} (codemode: tools.mcp__t3_code__task_cancel({"taskId":"task-1"}))');
+	expect(text).toContain('mcp__t3-code__t3_thread_send {"threadId":"thread-1","message":"..."} (codemode: tools.mcp__t3_code__t3_thread_send(');
+	expect(text).toContain('mcp__t3-code__task_status {"taskId":"task-1"} (codemode: tools.mcp__t3_code__task_status(');
+	expect([TASK_CANCEL, TASK_STATUS, THREAD_SEND, THREAD_READ]).toEqual([
+		"mcp__t3-code__task_cancel",
+		"mcp__t3-code__task_status",
+		"mcp__t3-code__t3_thread_send",
+		"mcp__t3-code__t3_thread_read",
+	]);
+});
+
+test("owner decision (S8): interactive and asking children tell the parent that the user answers in the child thread", async () => {
+	const ANSWER = "The user answers in the child thread. Do not ask the question again and do not relay it; end your turn.";
+	const bridge = bridgeFor((a) => (a.mode === "wait" ? delegateResult(numberOf(a), { hasPendingQuestion: true }) : delegateResult(numberOf(a))));
+	const result = await f.run(toolWith(width(16)), bridge, { children: [child("fx-c1", "fx-ask"), child("fx-c2", "fx-sync"), child("fx-c3")] });
+	const blocks = result.content[0].text.split("\n\n");
+	expect(blocks[0]).toContain(ANSWER); // interactive, running
+	expect(blocks[1]).toContain(ANSWER); // synchronous, waiting on a question
+	expect(blocks[2]).not.toContain(ANSWER); // background leaf
 });
