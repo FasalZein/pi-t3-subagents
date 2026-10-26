@@ -8,7 +8,13 @@ const EXPOSURES = ["direct", "codemode", "deferred"] as const;
 const OURS = "/ext/pi-t3-subagents/index.ts";
 const PI_SUBAGENTS = "/pkg/pi-subagents/src/index.ts";
 const FOREIGN = "/pkg/foreign-subagent/index.ts";
-const T3_ENV = { T3_MCP_URL: "http://127.0.0.1:1/mcp", T3_MCP_BEARER_TOKEN: "fake-token" };
+// Hermetic: an empty agents folder (no roster message) and no T3 settings file.
+const T3_ENV = {
+	T3_MCP_URL: "http://127.0.0.1:1/mcp",
+	T3_MCP_BEARER_TOKEN: "fake-token",
+	PI_T3_AGENTS_DIR: "/nonexistent/pi-t3-subagents-test/agents",
+	PI_T3_SETTINGS_PATH: "/nonexistent/pi-t3-subagents-test/settings.json",
+};
 const NOTICE_TYPE = "pi-t3-subagents-notice";
 
 type Env = Record<string, string | undefined>;
@@ -203,8 +209,8 @@ describe("disabled native tools cannot run on any call path", () => {
 	test("the T3 subagent itself is not blocked when nested", async () => {
 		const host = await boot({ ...T3_ENV });
 		await host.startSession();
-		// Not blocked: the spike tool runs and rejects the empty agent itself.
-		await expect(host.callTool("subagent", {}, { parentToolCallId: "codemode-1" })).rejects.toThrow("unsupported agent");
+		// Not blocked: the T3 tool runs and refuses the launch itself (no T3 settings here).
+		await expect(host.callTool("subagent", {}, { parentToolCallId: "codemode-1" })).rejects.toThrow("subagent launch refused");
 	});
 
 	test("outside T3 nothing is blocked", async () => {

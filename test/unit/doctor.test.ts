@@ -15,6 +15,7 @@ const T3_ENV = {
 	T3_MCP_URL: "http://127.0.0.1:1/mcp",
 	T3_MCP_BEARER_TOKEN: "fake-token",
 	PI_T3_SETTINGS_PATH: join(SETTINGS_DIR, "settings.json"),
+	PI_T3_AGENTS_DIR: join(SETTINGS_DIR, "agents"),
 };
 const BRIDGE = "builtin:mcp";
 
@@ -56,11 +57,11 @@ async function boot(extra: Array<[string, (pi: any) => void]> = [], copies: stri
 }
 
 describe("doctor inside T3", () => {
-	test("healthy session: C1, C2, C3, C6 and C7 pass", async () => {
+	test("healthy session: C1, C2, C3, C4, C6, C7 and C8 pass", async () => {
 		const host = await boot();
 		addBridge(host);
 		const lines = await doctorLines(host);
-		expect([...lines.keys()]).toEqual(["C1", "C2", "C3", "C6", "C7"]);
+		expect([...lines.keys()]).toEqual(["C1", "C2", "C3", "C4", "C6", "C7", "C8"]);
 		for (const line of lines.values()) expect(line).toContain(" PASS ");
 	});
 
