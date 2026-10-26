@@ -8,16 +8,15 @@
  * erase this write. The second case is detected by `verify`.
  */
 import { randomUUID } from "node:crypto";
-import { chmodSync, closeSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename, dirname, join } from "node:path";
 
-export const LOCK_STALE_MS = 60_000;
 export const BACKUPS_KEPT = 10;
 /** T3 debounces settings reloads by 100 ms; the spec waits up to 3 seconds. */
 export const DEFAULT_RELOAD_WAIT_MS = 3_000;
 const LOCK_POLL_MS = 50;
-const DEFAULT_LOCK_WAIT_MS = 30_000;
+const DEFAULT_LOCK_WAIT_MS = 5_000;
 const PRIVATE_DIR_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 
@@ -40,12 +39,15 @@ export interface WriteRequest {
 	readonly verify: (reloaded: unknown) => string[];
 	readonly reloadWaitMs?: number;
 	readonly lockWaitMs?: number;
+	/** --break-lock: remove one non-live lock that is unchanged since it was read. */
+	readonly breakLock?: boolean;
 	readonly hooks?: WriterHooks;
 	readonly now?: () => Date;
 }
 
 export type WriteOutcome =
-	| { readonly status: "written"; readonly backupPath: string }
+	| { readonly status: "written"; readonly backupPath: string; readonly brokenLock?: LockInfo }
+	| { readonly status: "locked"; readonly message: string; readonly lock: LockInfo }
 	| { readonly status: "changed"; readonly message: string }
 	| { readonly status: "lock-lost"; readonly message: string }
 	| { readonly status: "lost"; readonly backupPath: string; readonly message: string; readonly problems: readonly string[] };
@@ -64,58 +66,89 @@ export function lockPath(settingsPath: string): string {
 export interface WriterLock {
 	/** True while the lock file still holds this acquisition's token. */
 	owns(): boolean;
-	/** Removes the lock file only when this acquisition still owns it. */
+	/** Removes the lock file only when it still holds this acquisition's token. */
 	release(): void;
+	/** The lock this acquisition removed with --break-lock, if any. */
+	readonly broken?: LockInfo;
 }
 
-/**
- * Stale rule: a lock is taken over only when its holder cannot still be
- * writing. On this host that means the holder process no longer exists (a
- * live holder is never taken over, whatever the lock age, so it can never
- * release or commit over a newer holder). A lock from another host, or one
- * without a readable token, falls back to the age rule (older than 60 s).
- */
-function isStale(text: string, mtimeMs: number): boolean {
-	const [pid, host] = text.split(" ");
-	if (host === hostname() && /^\d+$/.test(pid ?? "")) {
-		try {
-			process.kill(Number(pid), 0);
-			return false; // Holder process alive.
-		} catch (error) {
-			return (error as NodeJS.ErrnoException).code === "ESRCH";
-		}
-	}
-	return Date.now() - mtimeMs > LOCK_STALE_MS;
+/** What a lock file says about its holder. */
+export interface LockInfo {
+	readonly path: string;
+	/** live: holder process exists on this host. gone: it does not. other-host, unreadable, malformed: liveness unknown. */
+	readonly state: "live" | "gone" | "other-host" | "unreadable" | "malformed";
+	readonly pid?: number;
+	readonly host?: string;
+	readonly ageMs?: number;
+	/** Content if readable, plus file identity; --break-lock removes the lock only while this is unchanged. */
+	readonly fingerprint: string;
 }
 
-/**
- * Break a stale lock without deleting a lock that replaced it: move it to a
- * private name first (atomic), then check what was moved. If a new lock was
- * moved by mistake, put it back; if that fails because a third lock exists,
- * the moved holder sees the new token and refuses to commit (lock-lost).
- */
-export function breakStaleLock(path: string, staleText: string): void {
-	const moved = `${path}.breaking-${randomUUID()}`;
-	try {
-		renameSync(path, moved);
-	} catch {
-		return; // Already gone.
+export class LockError extends Error {
+	constructor(
+		message: string,
+		readonly lock: LockInfo,
+	) {
+		super(message);
 	}
-	let movedText = "";
-	try {
-		movedText = readFileSync(moved, "utf8");
-	} catch {}
-	if (movedText !== staleText) {
-		try {
-			linkSync(moved, path);
-		} catch {}
-	}
-	try {
-		unlinkSync(moved);
-	} catch {}
 }
 
-export async function acquireLock(settingsPath: string, waitMs = DEFAULT_LOCK_WAIT_MS): Promise<WriterLock> {
+const MAX_PID = 4_194_304; // Upper bound of pid values on macOS and Linux.
+const TOKEN = /^(\d+) (\S+) ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
+
+/** Reads and classifies a lock file. Returns undefined when it does not exist. Never removes anything. */
+export function inspectLock(path: string): LockInfo | undefined {
+	let st: ReturnType<typeof statSync>;
+	try {
+		st = statSync(path);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		return { path, state: "unreadable", fingerprint: "stat-failed" };
+	}
+	const identity = `${st.ino}:${st.size}:${st.mtimeMs}`;
+	const ageMs = Math.max(0, Date.now() - st.mtimeMs);
+	let text: string;
+	try {
+		text = readFileSync(path, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		return { path, state: "unreadable", ageMs, fingerprint: identity };
+	}
+	const fingerprint = `${identity}|${text}`;
+	const m = TOKEN.exec(text);
+	const pid = m ? Number(m[1]) : NaN;
+	if (!m || !Number.isSafeInteger(pid) || pid < 1 || pid > MAX_PID) return { path, state: "malformed", ageMs, fingerprint };
+	const host = m[2];
+	if (host !== hostname()) return { path, state: "other-host", pid, host, ageMs, fingerprint };
+	return { path, state: processAlive(pid) ? "live" : "gone", pid, host, ageMs, fingerprint };
+}
+
+function processAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		// ESRCH: no such process. Anything else (EPERM: exists, owned by another user) counts as alive.
+		return (error as NodeJS.ErrnoException).code !== "ESRCH";
+	}
+}
+
+function describe(info: LockInfo): string {
+	const holder = info.pid !== undefined ? `process ${info.pid} on ${info.host}` : "unknown holder";
+	const age = info.ageMs !== undefined ? `, age ${Math.round(info.ageMs / 1000)} s` : "";
+	return `${info.path} (${info.state}: ${holder}${age})`;
+}
+
+export interface AcquireOptions {
+	/** Bounded wait for a live holder to finish (default 5 s). Other locks fail at once. */
+	readonly waitMs?: number;
+	/** Remove one non-live lock whose content is unchanged since it was read (user-confirmed by --break-lock). */
+	readonly breakLock?: boolean;
+	/** Test hook: runs after a lock was inspected for --break-lock and before it is removed. */
+	readonly beforeBreak?: () => void;
+}
+
+export async function acquireLock(settingsPath: string, options: AcquireOptions = {}): Promise<WriterLock> {
 	const path = lockPath(settingsPath);
 	const token = `${process.pid} ${hostname()} ${randomUUID()}`;
 	const owns = () => {
@@ -125,7 +158,8 @@ export async function acquireLock(settingsPath: string, waitMs = DEFAULT_LOCK_WA
 			return false;
 		}
 	};
-	const deadline = Date.now() + waitMs;
+	const deadline = Date.now() + (options.waitMs ?? DEFAULT_LOCK_WAIT_MS);
+	let broken: LockInfo | undefined;
 	for (;;) {
 		try {
 			const fd = openSync(path, "wx", PRIVATE_FILE_MODE);
@@ -133,8 +167,8 @@ export async function acquireLock(settingsPath: string, waitMs = DEFAULT_LOCK_WA
 			closeSync(fd);
 			return {
 				owns,
+				broken,
 				release() {
-					// Safe: a live holder's lock is never taken over, so the token cannot change under it.
 					if (!owns()) return;
 					try {
 						unlinkSync(path);
@@ -144,26 +178,27 @@ export async function acquireLock(settingsPath: string, waitMs = DEFAULT_LOCK_WA
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 		}
-		try {
-			const text = readFileSync(path, "utf8");
-			if (isStale(text, statSync(path).mtimeMs)) {
-				breakStaleLock(path, text);
-				continue;
-			}
-		} catch {
-			continue; // Released between open and read.
+		const info = inspectLock(path);
+		if (info && info.state === "live") {
+			if (Date.now() >= deadline)
+				throw new LockError(`settings writer lock is busy: ${describe(info)}. A running writer holds it; --break-lock never removes a live holder's lock.`, info);
+		} else if (info) {
+			if (!options.breakLock || broken)
+				throw new LockError(
+					`settings writer lock is held but its holder is not running here: ${describe(info)}. The sync does not remove locks on its own. If no sync is running, run /t3-sync-agents --break-lock.`,
+					info,
+				);
+			options.beforeBreak?.();
+			const now = inspectLock(path);
+			if (!now || now.fingerprint !== info.fingerprint || now.state === "live")
+				throw new LockError(`--break-lock refused: the lock changed since it was read: ${describe(now ?? info)}. Run the sync again.`, now ?? info);
+			unlinkSync(path);
+			broken = info;
+			continue;
 		}
-		if (Date.now() > deadline) throw new Error(`settings writer lock is busy: ${path} (held by ${holderOf(path)})`);
+		// Lock missing (released between open and inspect) or live holder within the wait: retry after a short sleep.
+		if (Date.now() >= deadline) throw new Error(`settings writer lock could not be taken: ${path}`);
 		await sleep(LOCK_POLL_MS);
-	}
-}
-
-function holderOf(path: string): string {
-	try {
-		const [pid, host] = readFileSync(path, "utf8").split(" ");
-		return `process ${pid} on ${host}`;
-	} catch {
-		return "unknown";
 	}
 }
 
@@ -205,7 +240,13 @@ const LOST = "lost to a concurrent T3 settings save; run the sync again";
 const LOCK_LOST = "the settings writer lock was taken over by another writer; run the sync again";
 
 export async function writeSettings(req: WriteRequest): Promise<WriteOutcome> {
-	const lock = await acquireLock(req.settingsPath, req.lockWaitMs);
+	let lock: WriterLock;
+	try {
+		lock = await acquireLock(req.settingsPath, { waitMs: req.lockWaitMs, breakLock: req.breakLock });
+	} catch (error) {
+		if (error instanceof LockError) return { status: "locked", message: error.message, lock: error.lock };
+		throw error;
+	}
 	let tmp: string | undefined;
 	let backupPath: string;
 	try {
@@ -236,5 +277,5 @@ export async function writeSettings(req: WriteRequest): Promise<WriteOutcome> {
 		problems = [`settings could not be read after the write: ${(error as Error).message}`];
 	}
 	if (problems.length > 0) return { status: "lost", backupPath, message: LOST, problems };
-	return { status: "written", backupPath };
+	return { status: "written", backupPath, ...(lock.broken ? { brokenLock: lock.broken } : {}) };
 }

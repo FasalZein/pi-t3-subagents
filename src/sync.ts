@@ -214,24 +214,27 @@ export interface SyncRunOptions {
 }
 
 export interface SyncReport {
-	readonly status: "up-to-date" | "written" | "declined" | "needs-yes" | "refused" | "changed" | "lock-lost" | "lost";
+	readonly status: "up-to-date" | "written" | "declined" | "needs-yes" | "refused" | "locked" | "changed" | "lock-lost" | "lost";
 	readonly text: string;
 	readonly plan?: SyncPlan;
 	readonly outcome?: WriteOutcome;
 }
 
-export function parseSyncArgs(args: string): { prune: boolean; yes: boolean; unknown: string[] } {
+const SYNC_FLAGS = ["--prune", "--yes", "--break-lock"];
+
+export function parseSyncArgs(args: string): { prune: boolean; yes: boolean; breakLock: boolean; unknown: string[] } {
 	const tokens = args.split(/\s+/).filter(Boolean);
 	return {
 		prune: tokens.includes("--prune"),
 		yes: tokens.includes("--yes"),
-		unknown: tokens.filter((t) => t !== "--prune" && t !== "--yes"),
+		breakLock: tokens.includes("--break-lock"),
+		unknown: tokens.filter((t) => !SYNC_FLAGS.includes(t)),
 	};
 }
 
 export async function runSync(opts: SyncRunOptions): Promise<SyncReport> {
-	const { prune, yes, unknown } = parseSyncArgs(opts.args);
-	if (unknown.length > 0) return { status: "refused", text: `Unknown arguments: ${unknown.join(" ")}. Usage: /t3-sync-agents [--prune] [--yes]` };
+	const { prune, yes, breakLock, unknown } = parseSyncArgs(opts.args);
+	if (unknown.length > 0) return { status: "refused", text: `Unknown arguments: ${unknown.join(" ")}. Usage: /t3-sync-agents [--prune] [--yes] [--break-lock]` };
 	const path = settingsPath(opts.env);
 	let originalText: string;
 	let settings: Settings;
@@ -263,14 +266,17 @@ export async function runSync(opts: SyncRunOptions): Promise<SyncReport> {
 		originalText,
 		nextText: `${JSON.stringify(next, null, 2)}\n`,
 		verify: (reloaded) => verifyPlan(reloaded, plan),
+		breakLock,
 		reloadWaitMs: opts.reloadWaitMs,
 		hooks: opts.hooks,
 	});
 	const counts = ["add", "update", "disable", "prune"]
 		.map((k) => `${k} ${plan.actions.filter((a) => a.kind === k).length}`)
 		.join(", ");
+	if (outcome.status === "locked") return { status: "locked", text: `${text}\nNot written: ${outcome.message}`, plan, outcome };
 	if (outcome.status === "changed" || outcome.status === "lock-lost") return { status: outcome.status, text: `${text}\n${outcome.message}`, plan, outcome };
 	if (outcome.status === "lost")
 		return { status: "lost", text: `${text}\n${outcome.message} (${outcome.problems.join("; ")}). Backup: ${outcome.backupPath}`, plan, outcome };
-	return { status: "written", text: `${text}\nWritten: ${counts}. Backup: ${outcome.backupPath}`, plan, outcome };
+	const broke = outcome.brokenLock ? `\nRemoved lock (--break-lock): ${outcome.brokenLock.path}, ${outcome.brokenLock.state}, holder ${outcome.brokenLock.pid ?? "unknown"} on ${outcome.brokenLock.host ?? "unknown"}.` : "";
+	return { status: "written", text: `${text}${broke}\nWritten: ${counts}. Backup: ${outcome.backupPath}`, plan, outcome };
 }

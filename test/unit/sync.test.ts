@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import { createExtension } from "../../index.ts";
 import { c6SettingsShape, c7LaunchArgs } from "../../src/doctor-checks.ts";
 import { runSync } from "../../src/sync.ts";
-import { acquireLock, breakStaleLock, writeSettings } from "../../src/settings-writer.ts";
+import { acquireLock, writeSettings } from "../../src/settings-writer.ts";
 import { resetCopyRegistry } from "../../src/takeover.ts";
 import { FakePiHost } from "../harness/fake-pi.ts";
 import { DefaultPackageManager } from "@earendil-works/pi-coding-agent";
@@ -531,23 +531,110 @@ describe("settings writer interleavings", () => {
 		expect(h.settingsText()).toBe('{"a":2}\n');
 	});
 
-	test("a live holder is never taken over, even when its lock is older than 60 s", async () => {
+	const deadPid = () => Bun.spawnSync(["true"]).pid;
+	const uuid = "0f0e0d0c-0b0a-4908-8706-050403020100";
+	const syncWithLockedEntry = (h: TempHost) => {
+		h.agent("leaf", "model: x/y");
+		return h.writeSettings({ providerInstances: { pi: mainEntry(h) } });
+	};
+
+	test("a live holder's lock is busy: bounded wait, then an error naming the pid; nothing written", async () => {
 		const h = host();
+		const original = syncWithLockedEntry(h);
 		const a = await acquireLock(h.settingsPath);
-		const old = new Date(Date.now() - 61_000);
-		utimesSync(lockFile(h), old, old);
-		await expect(acquireLock(h.settingsPath, 200)).rejects.toThrow("settings writer lock is busy");
+		const started = Date.now();
+		const out = await writeSettings({ settingsPath: h.settingsPath, stateDir: join(h.root, "s"), originalText: original, nextText: "{}\n", verify: () => [], reloadWaitMs: 0, lockWaitMs: 300 });
+		expect(Date.now() - started).toBeLessThan(2_000);
+		expect(out.status).toBe("locked");
+		expect((out as any).message).toContain(`process ${process.pid} on ${hostname()}`);
+		expect(h.settingsText()).toBe(original);
 		expect(a.owns()).toBe(true);
 		a.release();
-		const b = await acquireLock(h.settingsPath, 200);
-		expect(b.owns()).toBe(true);
-		b.release();
 	});
 
-	test("a writer keeps its lock through the commit even when the lock ages past 60 s", async () => {
+	test("a dead holder's lock is reported with path, pid, host and age, kept, and names --break-lock", async () => {
+		const h = host();
+		const original = syncWithLockedEntry(h);
+		const pid = deadPid();
+		writeFileSync(lockFile(h), `${pid} ${hostname()} ${uuid}`);
+		const report = await sync(h);
+		expect(report.status).toBe("locked");
+		expect(report.text).toContain(lockFile(h));
+		expect(report.text).toContain(`gone: process ${pid} on ${hostname()}, age `);
+		expect(report.text).toContain("/t3-sync-agents --break-lock");
+		expect(readFileSync(lockFile(h), "utf8")).toBe(`${pid} ${hostname()} ${uuid}`);
+		expect(h.settingsText()).toBe(original);
+	});
+
+	test("--break-lock removes a dead holder's lock once, then the locked sync writes and releases", async () => {
+		const h = host();
+		syncWithLockedEntry(h);
+		const pid = deadPid();
+		writeFileSync(lockFile(h), `${pid} ${hostname()} ${uuid}`);
+		const report = await sync(h, "--yes --break-lock");
+		expect(report.status).toBe("written");
+		expect(report.text).toContain(`Removed lock (--break-lock): ${lockFile(h)}, gone, holder ${pid}`);
+		expect(h.readSettings().providerInstances["pi-leaf"]).toBeDefined();
+		expect(readdirSync(join(h.root, "t3")).filter((f) => f.endsWith(".lock"))).toEqual([]);
+	});
+
+	test("--break-lock never removes a live holder's lock", async () => {
+		const h = host();
+		const original = syncWithLockedEntry(h);
+		const a = await acquireLock(h.settingsPath);
+		const out = await writeSettings({ settingsPath: h.settingsPath, stateDir: join(h.root, "s"), originalText: original, nextText: "{}\n", verify: () => [], reloadWaitMs: 0, lockWaitMs: 200, breakLock: true });
+		expect(out.status).toBe("locked");
+		expect((out as any).message).toContain(`busy: ${lockFile(h)} (live: process ${process.pid}`);
+		expect(a.owns()).toBe(true);
+		a.release();
+	});
+
+	test("--break-lock refuses when the lock changed after it was read", async () => {
+		const h = host();
+		const pid = deadPid();
+		writeFileSync(lockFile(h), `${pid} ${hostname()} ${uuid}`);
+		const replaced = `${pid} ${hostname()} 11111111-2222-4333-8444-555555555555`;
+		await expect(acquireLock(h.settingsPath, { breakLock: true, beforeBreak: () => writeFileSync(lockFile(h), replaced) })).rejects.toThrow("--break-lock refused: the lock changed");
+		expect(readFileSync(lockFile(h), "utf8")).toBe(replaced);
+	});
+
+	test("unreadable and malformed locks are reported at once (no loop) and kept; --break-lock removes a malformed one", async () => {
+		const h = host();
+		const { chmodSync } = await import("node:fs");
+		for (const content of ["garbage", `123 ${hostname()}`, `99999999999 ${hostname()} ${uuid}`, `0 ${hostname()} ${uuid}`]) {
+			writeFileSync(lockFile(h), content);
+			const started = Date.now();
+			await expect(acquireLock(h.settingsPath)).rejects.toThrow("(malformed: unknown holder");
+			expect(Date.now() - started).toBeLessThan(500);
+			expect(readFileSync(lockFile(h), "utf8")).toBe(content);
+		}
+		writeFileSync(lockFile(h), "other 1");
+		chmodSync(lockFile(h), 0o000);
+		const started = Date.now();
+		await expect(acquireLock(h.settingsPath)).rejects.toThrow("(unreadable: unknown holder");
+		expect(Date.now() - started).toBeLessThan(500);
+		chmodSync(lockFile(h), 0o600);
+		writeFileSync(lockFile(h), "123 some-other-host " + uuid);
+		await expect(acquireLock(h.settingsPath)).rejects.toThrow("(other-host: process 123 on some-other-host");
+		writeFileSync(lockFile(h), "garbage");
+		const lock = await acquireLock(h.settingsPath, { breakLock: true });
+		expect(lock.broken?.state).toBe("malformed");
+		lock.release();
+	});
+
+	test("release removes only the writer's own lock", async () => {
+		const h = host();
+		const a = await acquireLock(h.settingsPath);
+		const other = `${process.pid} ${hostname()} ${uuid}`;
+		writeFileSync(lockFile(h), other);
+		expect(a.owns()).toBe(false);
+		a.release();
+		expect(readFileSync(lockFile(h), "utf8")).toBe(other);
+	});
+
+	test("a writer whose token is no longer in the lock file does not commit", async () => {
 		const h = host();
 		const text = h.writeSettings({ a: 1 });
-		let takeover: unknown;
 		const out = await writeSettings({
 			settingsPath: h.settingsPath,
 			stateDir: join(h.root, "state"),
@@ -555,42 +642,10 @@ describe("settings writer interleavings", () => {
 			nextText: '{"a":2}\n',
 			verify: () => [],
 			reloadWaitMs: 0,
-			hooks: {
-				beforeFinalCompare: async () => {
-					const old = new Date(Date.now() - 61_000);
-					utimesSync(lockFile(h), old, old);
-					takeover = await acquireLock(h.settingsPath, 200).then(() => "acquired", (e: Error) => e.message);
-				},
-			},
+			hooks: { beforeFinalCompare: () => writeFileSync(lockFile(h), `${process.pid} ${hostname()} ${uuid}`) },
 		});
-		expect(takeover).toContain("settings writer lock is busy");
-		expect(out.status).toBe("written");
-		expect(h.settingsText()).toBe('{"a":2}\n');
-	});
-
-	test("a lock whose holder process is gone is taken over at once; another host's lock after 60 s", async () => {
-		const h = host();
-		const deadPid = Bun.spawnSync(["true"]).pid;
-		writeFileSync(lockFile(h), `${deadPid} ${hostname()} dead-token`);
-		const a = await acquireLock(h.settingsPath, 200);
-		a.release();
-		writeFileSync(lockFile(h), "123 some-other-host remote-token");
-		await expect(acquireLock(h.settingsPath, 200)).rejects.toThrow("held by process 123 on some-other-host");
-		const old = new Date(Date.now() - 61_000);
-		utimesSync(lockFile(h), old, old);
-		const b = await acquireLock(h.settingsPath, 200);
-		b.release();
-	});
-
-	test("breaking a stale lock puts back a lock that replaced it", () => {
-		const h = host();
-		const live = `${process.pid} ${hostname()} live-token`;
-		writeFileSync(lockFile(h), live);
-		breakStaleLock(lockFile(h), `999999 ${hostname()} dead-token`);
-		expect(readFileSync(lockFile(h), "utf8")).toBe(live);
-		expect(readdirSync(join(h.root, "t3")).filter((f) => f.includes("breaking"))).toEqual([]);
-		breakStaleLock(lockFile(h), live);
-		expect(readdirSync(join(h.root, "t3")).filter((f) => f.includes("lock"))).toEqual([]);
+		expect(out.status).toBe("lock-lost");
+		expect(h.settingsText()).toBe(text);
 	});
 
 	test("backups: mode 0600 in a 0700 folder, newest 10 kept", async () => {

@@ -312,7 +312,7 @@ Known drift: a wake that never arrives (for example after a Pi process restart, 
 2. Plan per agent: add, update, unchanged, disable, prune (only with `--prune`), conflict (id exists without matching markers), skip (with reason). Collect gap notes. Warn when the main instance lacks the extension argument.
 3. Show the plan. No environment values appear in it. No changes: report "up to date"; no write, no backup.
 4. Confirm through the UI; without a UI require `--yes`.
-5. Take the own-writer lock: a lock file next to the settings file (`.settings.json.pi-t3-subagents.lock`), created exclusively, that holds the holder's process id, host name and a random token. Every Pi profile that targets one settings file shares this lock. A lock is stale only when its holder process no longer exists on this host; a lock from another host or without a readable token is stale after 60 seconds. A live holder is never taken over, so it releases only its own lock. A stale lock is moved aside before it is removed, and a lock moved by mistake is put back; a writer whose token is no longer in the lock file does not commit. The lock serializes this extension's writers (sync, live-test setup and teardown); it does not lock T3. Revised after the S2 re-review (age-only takeover could take over a live holder).
+5. Take the own-writer lock: a lock file next to the settings file (`.settings.json.pi-t3-subagents.lock`), created exclusively (mode 0600), that holds `<pid> <host> <random id>`. Every Pi profile that targets one settings file shares it. It serializes this extension's writers (sync, live-test setup and teardown); it does not lock T3. The sync never removes a lock on its own (owner decision 2026-10-26, after the S2 reviews). A lock whose holder process is alive on this host is busy: the sync waits at most a few seconds, then stops with an error that names the holder pid; `--break-lock` never removes it. Any other lock (holder process gone, another host, unreadable or malformed content) stops the sync at once with the lock path, holder pid and host, and age, and tells the user to run `/t3-sync-agents --break-lock`. `--break-lock` removes that lock once, only when its content (or, for an unreadable lock, its file identity) is unchanged since it was read and shown; otherwise it refuses. Then the normal locked sync runs. A release removes only the writer's own lock, and a writer whose token is no longer in the lock file does not commit.
 6. Save the backup (folder mode 0700, file mode 0600); keep the newest 10.
 7. Write the new content to a temporary file in the settings folder (mode 0600). Change only the planned `providerInstances` entries; keep all other content.
 8. Read the settings file again and compare it with the content from step 1. If it changed, delete the temporary file, release the lock, and stop: "settings changed, run the sync again". Otherwise rename the temporary file over `settings.json` at once.
@@ -449,5 +449,110 @@ Delivers: the launch planner for single launches (validation, first message, A1,
 - [ ] Layer 1: first messages match the expected text for: header, injected skills, absent `system-prompt`, background hint, interactive hint, shell expansion.
 - [ ] Layer 1: the roster lists only enabled global agents that the caller may launch, with T3 lifecycle wording, and is sent again only when it changes.
 - [ ] Layer 1 child: a header is removed and stored; a missing header gives the agent's own depth; an unreadable header gives budget 0; a revision mismatch replaces the input with the stale instruction.
+- [ ] Layer 2: a child's prompt starts with the agent body and has no frontmatter (U6); an `env` value from the agent file is visible to a later extension and to bash (U13); the header is not in the stored user message (U7); an agent with an extension list does not get the whole bridge catalog active (U5).
+- [ ] Live (`t3e2e-s3-`): the parent launches a leaf fixture with a model override and a fixture with shell expansion; both child threads show lineage (one browser screenshot) and the expected model; both wakes arrive. Record how the takeover notice appears (U18) by loading a namespace main instance with a forced suppression failure.
+- [ ] Live: after a fixture change without a sync, the launch is refused with the sync message; after a sync followed at once by a launch, the child runs the new revision or returns the stale reply (U17).
 
-[Showing lines 1-451 of 559 (50.0KB limit). Use offset=452 to continue.]
+### S4: Synchronous launches, batches and width ledger
+
+Blocked by: S3.
+
+Delivers: `children[]` batches, synchronous launches with the four result states, and the live-children ledger with every transition in its table. Doctor check C5.
+
+- [ ] Layer 1: one invalid child means no bridge call; a batch larger than the free width fails before launch; two parallel `subagent` calls with width 1 start one child and refuse the other.
+- [ ] Layer 1: when the fake bridge fails the second of three children, the first stays started, the third is never sent, the error lists the first child's ids, and the unused reservations are released.
+- [ ] Layer 1: each ledger transition in the table, including `t3_thread_send` reservation and blocking, wakes with several tasks and the short form, and the fail-open path on an unreadable wake.
+- [ ] Layer 1: a batch with two synchronous children and one asynchronous child starts all three before awaiting; the synchronous results arrive as `finished`, `waiting` or `wait_timed_out` items with the right text.
+- [ ] Live (`t3e2e-s4-`): a batch of two leaf fixtures gives two wakes and an empty ledger (U8); a synchronous fixture returns its reply inline and no later wake arrives; two synchronous fixtures in one batch run at the same time (U15); a synchronous fixture that asks a question returns `waiting`, and the run records whether a wake follows (U19); record whether a user stop in a child thread wakes the parent (U9).
+
+### S5: Nested launches, exact depth and raw-delegation guard
+
+Blocked by: S3.
+
+Delivers: caller identity, allowlist, visibility, self-launch guard, the exact budget, tool exposure for spawners and leaves, and the raw-delegation guard (D22).
+
+- [ ] Layer 1: the header budget is min(child depth, caller budget minus 1); budget 0 removes `subagent` and the thread-starting bridge tools in the child.
+- [ ] Layer 1: the caller's `spawning` list, the target's `visible-to` and the self-launch guard each refuse with a clear error.
+- [ ] Layer 1 guard: in a child, raw `delegate_task` from the model and from a codemode script is refused, and the wrapper's own nested call passes; in root, a raw call to a managed instance is refused and a call to a non-managed instance passes; without `parentToolCallId` the guard refuses.
+- [ ] Layer 2: an instance with a fixed tool list that may spawn has `subagent` and the named bridge tools active (U2); a leaf has neither.
+- [ ] Live (`t3e2e-s5-`): a spawning fixture child launches a leaf grandchild; the grandchild's wake reaches the child thread and the child's wake reaches root; a spawning fixture launched with budget 1 cannot launch; raw `delegate_task` attempts from a leaf, a spawning child and codemode are refused (U14).
+
+### S6: Caller ping and lifecycle guidance
+
+Blocked by: S3.
+
+Delivers: the `caller_ping` tool in managed children, and live proof of the T3 lifecycle tools named in the launch result.
+
+- [ ] Layer 1: `caller_ping` exists only in managed children; after a ping, other tool calls in that run are refused with the ping reason.
+- [ ] Live (`t3e2e-s6-`): a child that calls `caller_ping` ends its run; the wake reply starts with `CALLER PING`; the parent continues the child with `t3_thread_send` and receives the final wake.
+- [ ] Live: the parent stops a running child with `task_cancel` (U3) and the child stops.
+
+### S7: Context warnings and time limit
+
+Blocked by: S3.
+
+Delivers: `context-warn-threshold`, `context-warn-step`, `timeout-warn-threshold` and `timeout` in the child runtime, per run.
+
+- [ ] Layer 1: with a fake clock and fake context usage, the steers and the abort happen at the expected points, once per step; a follow-up run starts a new timer.
+- [ ] Live (`t3e2e-s7-`): a fixture with a very short limit gets the warning steer, its run stops at the limit, and the parent wake shows the final status; the report records that status for the README.
+
+### S8: Interactive agents
+
+Blocked by: S3.
+
+Delivers: interactive fixtures with `auto-exit: false` run as child threads that the user steers, with `ask_user` as T3 question cards.
+
+- [ ] Layer 1: the interactive hint is used only for `mode: interactive` with `auto-exit: false`.
+- [ ] Live (`t3e2e-s8-`, browser): an interactive fixture with pi-ask in its extension list asks one `ask_user` question; the card appears in the child thread; the answer reaches the child; the child's final reply wakes the parent; a follow-up typed in the finished child thread wakes the parent again.
+
+### S9: README, supervised-mode check, doctor completeness
+
+Blocked by: S4, S5, S6, S7, S8.
+
+Delivers: a README for any pi-subagents user (purpose, setup on a main instance, sync, field mapping with gaps, lifecycle with T3 tools, caller ping, supervised behavior, the settings-write risk, compatibility contracts and the doctor, update advice), an updated header comment in the entry file, and a doctor that covers C1 to C10.
+
+- [ ] Live (`t3e2e-s9-`): in `approval-required` mode one launch shows the approvals that the README describes, and the child inherits the mode (U1).
+- [ ] Live: a worker follows the README from a fresh namespace main instance without the extension and gets a working leaf launch.
+- [ ] The doctor output lists C1 to C10 with pass or fail; the README lists every gap and links the ADRs.
+
+### S10: Rollout to the owner's setup
+
+Blocked by: S9.
+
+Delivers: the authorized switch of the owner's real setup (D27). Exact steps:
+
+1. Move the release copy to the landed tip (detached checkout); the main instance path stays the same.
+2. Delete the spike `pi-scout` through the settings writer (backup first).
+3. From a thread on the main instance, run `/t3-sync-agents` in the production namespace for the owner's agents.
+4. Launch `scout` from a main-instance thread in the scratch project and confirm the wake.
+5. Run `/t3-subagents-doctor`.
+
+- [ ] All managed instances of the owner's enabled agents exist and are available; no unmarked `pi-` instance remains from the spike.
+- [ ] The scout launch works and the doctor reports no broken contract.
+- [ ] The report names every backup path for rollback.
+
+## Out of Scope
+
+- Changes to T3 Code, Pi or pi-subagents, and any edit of their install files.
+- Project agents and per-project instances (D18, deferred).
+- Skill annotations `=auto` and `=manual` (D9).
+- The gaps in the field mapping table.
+- A guarantee against a concurrent T3 settings save (D19).
+- A separate command-line sync tool (A7).
+- Bypassing the T3 bridge to save one approval (D16).
+
+## Further Notes
+
+Risks:
+
+- **Takeover depends on pi-subagents internals** (C1, ADR 0001). After a pi-subagents update it fails soft; run the doctor.
+- **Settings race** (D19, ADR 0005): small, documented, partly detected.
+- **Load and cost:** T3 runs model and command discovery per managed instance and project. Discovery loads the extension without T3 variables; it must stay quiet there.
+- **Ledger drift** (see the ledger table).
+- **Wake size:** at most 16,000 bytes of child replies inline per wake. Long reports belong in files.
+- **Supervised children:** in async mode the parent gets no signal when a child waits for an approval in its own thread.
+- **T3 Nightly changes:** the T3 facts come from one nightly build; run the doctor after updates.
+
+Rollback: restore the newest backup from `~/.pi/agent/t3-subagents/backups/` over `~/.t3/userdata/settings.json`.
+
+OPEN: none. Deferred: project agents (D18), skill annotations (D9). Unverified facts U1 to U19 (without U10) are acceptance checks in the named slices.

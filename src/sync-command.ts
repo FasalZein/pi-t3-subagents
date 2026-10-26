@@ -9,7 +9,7 @@ export const EXTENSION_ENTRY = join(dirname(dirname(fileURLToPath(import.meta.ur
 
 export function registerSyncCommand(pi: ExtensionAPI, env: NodeJS.ProcessEnv = process.env): void {
 	pi.registerCommand("t3-sync-agents", {
-		description: "Sync pi-subagents agents to managed T3 provider instances. Usage: /t3-sync-agents [--prune] [--yes]",
+		description: "Sync pi-subagents agents to managed T3 provider instances. Usage: /t3-sync-agents [--prune] [--yes] [--break-lock]",
 		handler: async (args, ctx) => {
 			const report = await runSync({
 				args: args ?? "",
