@@ -31,6 +31,7 @@ import { type LaunchOutcome, subagentToolFor } from "./src/subagent-tool.ts";
 import { registerSyncCommand } from "./src/sync-command.ts";
 import { installTakeover, isInsideT3, takeoverChecks } from "./src/takeover.ts";
 import { installManagedChildTools } from "./src/managed-child-tools.ts";
+import { runLimitsInstaller } from "./src/run-limits.ts";
 
 type Env = Record<string, string | undefined>;
 
@@ -66,6 +67,11 @@ export function createExtension(env: Env = process.env, copyId: string = import.
 			// [slot S6] caller_ping and its run latch: begin
 			// [slot S6] end
 			// [slot S7] context warnings and time limit: begin
+			// Thresholds come from the current agent file, read again at the start of each run.
+			runLimitsInstaller((managed) => {
+				const name = managed.state()?.agent;
+				return readCatalog(agentsDir(env as NodeJS.ProcessEnv)).agents.find((a) => a.name === name);
+			}),
 			// [slot S7] end
 		]);
 		// [slot S8] interactive agents: begin
