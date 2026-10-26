@@ -117,21 +117,16 @@ export class Ledger {
 	/** Launch keys that reached T3: an exact retry gets T3's replay, never a new child (D23). */
 	private readonly launchedKeys = new Set<string>();
 	/**
-	 * Task ids seen in a terminal state (final response, wake, cancel, final status or read).
-	 * Terminal is monotonic: a late non-final response cannot make such a task live again.
+	 * Task ids seen closed (final response, wake, cancel, final status or read of their thread).
+	 * Closed is monotonic: a late non-final response cannot make such a task live again.
 	 */
 	private readonly ended = new Set<string>();
 	/** Child threads launched by this process: t3_thread_send to them counts toward width. */
 	private readonly threads = new Set<string>();
-	/** t3_thread_send tool call id -> its reservation. */
-	private readonly sends = new Map<string, string>();
-	/** t3_thread_read tool call id -> the live tasks of that thread when the read started. */
-	private readonly reads = new Map<string, string[]>();
-	/**
-	 * Run ids that a t3_thread_read reported terminal. A send response that names such a run
-	 * arrived after the read already acknowledged its result: no wake comes, the task is ended.
-	 */
-	private readonly endedRuns = new Set<string>();
+	/** Task id -> its child thread, for every task this ledger has seen. */
+	private readonly taskThreads = new Map<string, string>();
+	/** t3_thread_send tool call id -> its reservation and target thread. */
+	private readonly sends = new Map<string, { reservation: string; threadId: string }>();
 	private nextId = 1;
 	private failOpen: string | null = null;
 
@@ -204,14 +199,36 @@ export class Ledger {
 		this.ended.add(taskId);
 	}
 
-	private record(task: { taskId: string; childThreadId: string; status: string; runId?: string }): void {
+	/**
+	 * Owner decision (prefer freeing slots): a terminal observation of a thread ends every live
+	 * task of that thread and every t3_thread_send to it that is still waiting for its response,
+	 * whatever the arrival order. Width can be briefly undercounted; a slot is never stuck.
+	 */
+	private closeThread(threadId: string | undefined): void {
+		if (threadId === undefined) return;
+		for (const task of [...this.live.values()]) if (task.childThreadId === threadId) this.end(task.taskId);
+		for (const [callId, send] of [...this.sends]) {
+			if (send.threadId !== threadId) continue;
+			this.sends.delete(callId);
+			this.release(send.reservation);
+		}
+	}
+
+	/** End a task and close its thread (when known). */
+	private closeTask(taskId: string, threadId?: string): void {
+		this.end(taskId);
+		this.closeThread(threadId ?? this.taskThreads.get(taskId));
+	}
+
+	private record(task: { taskId: string; childThreadId: string; status: string }): void {
 		this.threads.add(task.childThreadId);
-		if (FINAL_TASK_STATUSES.has(task.status) || (task.runId !== undefined && this.endedRuns.has(task.runId))) this.end(task.taskId);
+		this.taskThreads.set(task.taskId, task.childThreadId);
+		if (FINAL_TASK_STATUSES.has(task.status)) this.end(task.taskId);
 		else if (!this.ended.has(task.taskId)) this.live.set(task.taskId, { taskId: task.taskId, childThreadId: task.childThreadId });
 	}
 
 	/** A send response: a non-final status makes the reservation a live task; a final one releases it. */
-	settle(reservation: string, task: { taskId: string; childThreadId: string; status: string; runId?: string }): void {
+	settle(reservation: string, task: { taskId: string; childThreadId: string; status: string }): void {
 		if (!this.reservations.has(reservation)) return;
 		this.release(reservation);
 		this.record(task);
@@ -244,25 +261,18 @@ export class Ledger {
 			this.failOpen = `unreadable wake at ${new Date().toISOString()}: ${JSON.stringify(text.slice(0, 120))}`;
 			return FAIL_OPEN_NOTICE;
 		}
-		for (const id of parsed.taskIds) this.end(id);
+		for (const id of parsed.taskIds) this.closeTask(id);
 		return undefined;
 	}
 
-	/**
-	 * tool_call: t3_thread_send to a known child thread reserves one slot, or returns the block
-	 * reason; t3_thread_read records the thread's live tasks, so its result ends only those.
-	 */
+	/** tool_call: t3_thread_send to a known child thread reserves one slot, or returns the block reason. */
 	observeCall(event: { toolName: string; toolCallId: string; input?: any }): string | undefined {
 		const threadId = event.input?.threadId;
 		if (typeof threadId !== "string") return undefined;
-		if (event.toolName === THREAD_READ) {
-			this.reads.set(event.toolCallId, [...this.live.values()].filter((t) => t.childThreadId === threadId).map((t) => t.taskId));
-			return undefined;
-		}
 		if (event.toolName !== THREAD_SEND || !this.threads.has(threadId) || this.sends.has(event.toolCallId)) return undefined;
 		try {
 			const [reservation] = this.reserve(1);
-			this.sends.set(event.toolCallId, reservation!);
+			this.sends.set(event.toolCallId, { reservation: reservation!, threadId });
 			return undefined;
 		} catch (error) {
 			return `t3_thread_send blocked: ${(error as Error).message}`;
@@ -271,11 +281,10 @@ export class Ledger {
 
 	/** End of any tool call: a t3_thread_send reservation still open (blocked, aborted) is released. */
 	endCall(event: { toolCallId: string }): void {
-		this.reads.delete(event.toolCallId);
-		const reservation = this.sends.get(event.toolCallId);
-		if (reservation === undefined) return;
+		const send = this.sends.get(event.toolCallId);
+		if (send === undefined) return;
 		this.sends.delete(event.toolCallId);
-		this.release(reservation);
+		this.release(send.reservation);
 	}
 
 	/** tool_result of the bridge tools the ledger follows. */
@@ -283,54 +292,36 @@ export class Ledger {
 		const data = event.isError ? undefined : bridgeData(event);
 		switch (event.toolName) {
 			case THREAD_SEND: {
-				const reservation = this.sends.get(event.toolCallId);
-				if (reservation === undefined) return;
+				// A send that a terminal observation of its thread closed has no entry: ignored.
+				const send = this.sends.get(event.toolCallId);
+				if (send === undefined) return;
 				this.sends.delete(event.toolCallId);
-				const threadId = String(data?.threadId ?? event.input?.threadId);
 				if (data?.isError !== true && typeof data?.taskId === "string")
-					this.settle(reservation, {
-						taskId: data.taskId,
-						childThreadId: threadId,
-						status: String(data.status ?? "running"),
-						...(typeof data.runId === "string" ? { runId: data.runId } : {}),
-					});
-				else this.release(reservation);
+					this.settle(send.reservation, { taskId: data.taskId, childThreadId: String(data.threadId ?? send.threadId), status: String(data.status ?? "running") });
+				else this.release(send.reservation);
 				return;
 			}
 			case TASK_CANCEL: {
 				// Any status: T3 disposes the automatic delivery, so no wake comes.
 				const taskId = data?.taskId ?? event.input?.taskId;
-				if (data && typeof taskId === "string") this.end(taskId);
+				if (data && typeof taskId === "string") this.closeTask(taskId);
 				return;
 			}
 			case TASK_STATUS: {
 				const taskId = data?.taskId ?? event.input?.taskId;
-				if (typeof taskId === "string" && FINAL_TASK_STATUSES.has(String(data?.status))) this.end(taskId);
+				if (typeof taskId === "string" && FINAL_TASK_STATUSES.has(String(data?.status)))
+					this.closeTask(taskId, typeof data?.childThreadId === "string" ? data.childThreadId : undefined);
 				return;
 			}
 			case THREAD_READ: {
-				// Reading a child's final result marks it read and suppresses the wake (T3 facts). Only
-				// the tasks live when the read started: a continuation sent meanwhile is a newer run.
-				const seen = this.reads.get(event.toolCallId) ?? [];
-				this.reads.delete(event.toolCallId);
-				for (const runId of terminalRuns(data)) this.endedRuns.add(runId);
+				// Reading a child's final result marks it read and suppresses the wake (T3 facts).
+				const threadId = event.input?.threadId;
 				const status = data?.status ?? data?.thread?.status;
-				if (!FINAL_TASK_STATUSES.has(String(status))) return;
-				for (const taskId of seen) this.end(taskId);
+				if (typeof threadId === "string" && FINAL_TASK_STATUSES.has(String(status))) this.closeThread(threadId);
 				return;
 			}
 		}
 	}
-}
-
-/** Run ids a t3_thread_read result reports terminal: recent runs, and the latest run of a final thread. */
-function terminalRuns(data: any): string[] {
-	const runs: string[] = [];
-	for (const run of [...(Array.isArray(data?.recentRuns) ? data.recentRuns : []), ...(Array.isArray(data?.runs) ? data.runs : [])])
-		if (typeof run?.runId === "string" && FINAL_TASK_STATUSES.has(String(run.status))) runs.push(run.runId);
-	const thread = data?.thread ?? data;
-	if (typeof thread?.latestRunId === "string" && FINAL_TASK_STATUSES.has(String(thread.status))) runs.push(thread.latestRunId);
-	return runs;
 }
 
 /**

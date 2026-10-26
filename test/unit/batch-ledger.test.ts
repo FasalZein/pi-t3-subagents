@@ -369,7 +369,9 @@ test("review F1: a wake or a cancel before the delayed running response keeps th
 	expect(ledger.snapshot()).toMatchObject({ live: [], reserved: 0 });
 });
 
-test("review F2: a delayed terminal t3_thread_read does not remove a continuation sent during the read", async () => {
+// Owner decision (final, prefer freeing slots): a terminal read ends every task of its thread,
+// also a continuation that started during the read. This replaces the first review's F2 rule.
+test("owner decision: a delayed terminal t3_thread_read also ends a continuation sent during the read (slot freed)", async () => {
 	const ledger = width(1);
 	const [old] = ledger.reserve(1);
 	ledger.settle(old!, { taskId: "old", childThreadId: "child", status: "completed" });
@@ -388,10 +390,11 @@ test("review F2: a delayed terminal t3_thread_read does not remove a continuatio
 	const read = call(host, THREAD_READ, { threadId: "child" });
 	await inRead;
 	await call(host, THREAD_SEND, { threadId: "child", message: "continue" });
+	expect(liveIds(ledger)).toEqual(["new"]);
 	release();
 	await read;
-	expect(liveIds(ledger)).toEqual(["new"]);
-	expect(() => ledger.reserve(1)).toThrow(/spawn width is full/);
+	expect(ledger.snapshot()).toMatchObject({ live: [], reserved: 0 });
+	expect(ledger.reserve(1)).toHaveLength(1);
 });
 
 test("review F3: an exact retry at full width reaches T3 (replay) and charges no second slot; a changed request is refused", async () => {
@@ -551,26 +554,85 @@ test("re-review B: a terminal read of the continuation's run before its send res
 	expect(ledger.reserve(1)).toHaveLength(1);
 });
 
-test("re-review B: a terminal read of an older run does not end a newer continuation run", async () => {
-	const ledger = width(2);
-	const [old] = ledger.reserve(1);
-	ledger.settle(old!, { taskId: "old-task", childThreadId: "child", status: "completed" });
-	let entered!: () => void;
-	let release!: () => void;
-	const inSend = new Promise<void>((r) => (entered = r));
-	const gate = new Promise<void>((r) => (release = r));
+/** Gated send and read on one child thread; the test chooses the order of the two responses. */
+async function sendAndRead(ledger: Ledger) {
+	const gates = { sendIn: Promise.withResolvers<void>(), readIn: Promise.withResolvers<void>(), send: Promise.withResolvers<void>(), read: Promise.withResolvers<void>() };
 	const bridge = new FakeBridge()
 		.respond(THREAD_SEND, async () => {
-			entered();
-			await gate;
+			gates.sendIn.resolve();
+			await gates.send.promise;
 			return { threadId: "child", taskId: "new-task", runId: "new-run", status: "running", delivery: "started" };
 		})
-		.respond(THREAD_READ, () => ({ thread: { threadId: "child", status: "completed", latestRunId: "old-run" }, recentRuns: [{ runId: "old-run", status: "completed" }], items: [] }));
+		.respond(THREAD_READ, async () => {
+			gates.readIn.resolve();
+			await gates.read.promise;
+			return { thread: { threadId: "child", status: "completed", latestRunId: "new-run" }, recentRuns: [{ runId: "new-run", status: "completed" }], items: [] };
+		});
 	const host = await ledgerHost(ledger, bridge);
 	const sending = call(host, THREAD_SEND, { threadId: "child", message: "continue" });
-	await inSend;
-	await call(host, THREAD_READ, { threadId: "child" });
-	release();
+	await gates.sendIn.promise;
+	const reading = call(host, THREAD_READ, { threadId: "child" });
+	await gates.readIn.promise;
+	return { host, gates, sending, reading };
+}
+
+function finishedChild(limit: number) {
+	const ledger = width(limit);
+	const [old] = ledger.reserve(1);
+	ledger.settle(old!, { taskId: "old-task", childThreadId: "child", status: "completed" });
+	return ledger;
+}
+
+test("owner decision: send response first, then a terminal read of the thread: 0 live, slot free (final review order)", async () => {
+	const ledger = finishedChild(1);
+	const { gates, sending, reading } = await sendAndRead(ledger);
+	gates.send.resolve();
 	await sending;
-	expect(liveIds(ledger)).toEqual(["new-task"]);
+	gates.read.resolve();
+	await reading;
+	expect(ledger.snapshot()).toMatchObject({ live: [], reserved: 0 });
+	expect(ledger.reserve(1)).toHaveLength(1);
+});
+
+test("owner decision: terminal read first, then the send response: 0 live, slot free", async () => {
+	const ledger = finishedChild(1);
+	const { gates, sending, reading } = await sendAndRead(ledger);
+	gates.read.resolve();
+	await reading;
+	gates.send.resolve();
+	await sending;
+	expect(ledger.snapshot()).toMatchObject({ live: [], reserved: 0 });
+	expect(ledger.reserve(1)).toHaveLength(1);
+});
+
+test("owner decision: a new continuation with a new task id after a terminal read is counted", async () => {
+	const ledger = finishedChild(1);
+	const bridge = new FakeBridge()
+		.respond(THREAD_READ, () => ({ thread: { threadId: "child", status: "completed" }, items: [] }))
+		.respond(THREAD_SEND, () => ({ threadId: "child", taskId: "next-task", status: "running", delivery: "started" }));
+	const host = await ledgerHost(ledger, bridge);
+	await call(host, THREAD_READ, { threadId: "child" });
+	await call(host, THREAD_SEND, { threadId: "child", message: "more" });
+	expect(liveIds(ledger)).toEqual(["next-task"]);
+	expect(() => ledger.reserve(1)).toThrow(/spawn width is full/);
+});
+
+test("owner decision: a wake, a final task_status or a task_cancel for one task ends every live task of its thread", async () => {
+	for (const close of ["wake", "status", "cancel"] as const) {
+		const ledger = width(4);
+		const [a, b, c] = ledger.reserve(3);
+		ledger.settle(a!, { taskId: "t1", childThreadId: "child", status: "running" });
+		ledger.settle(b!, { taskId: "t2", childThreadId: "child", status: "running" });
+		ledger.settle(c!, { taskId: "t3", childThreadId: "other", status: "running" });
+		const host = await ledgerHost(
+			ledger,
+			new FakeBridge()
+				.respond(TASK_STATUS, (x) => ({ taskId: x.taskId, childThreadId: "child", status: "completed" }))
+				.respond(TASK_CANCEL, (x) => ({ taskId: x.taskId, status: "cancel_requested" })),
+		);
+		if (close === "wake") ledger.observeInput("Delegated task t1 (A) [completed]:\nok");
+		if (close === "status") await call(host, TASK_STATUS, { taskId: "t1" });
+		if (close === "cancel") await call(host, TASK_CANCEL, { taskId: "t1" });
+		expect([close, liveIds(ledger)]).toEqual([close, ["t3"]]);
+	}
 });
