@@ -1,0 +1,141 @@
+[
+ [
+  "open",
+  "http://127.0.0.1:3773/"
+ ],
+ [
+  "wait",
+  "--text",
+  "t3e2e-s8 flow parent"
+ ],
+ [
+  "find",
+  "role",
+  "button",
+  "click",
+  "--name",
+  "t3e2e-s8 flow parent, "
+ ],
+ [
+  "wait",
+  "--text",
+  "S8 flow check"
+ ],
+ [
+  "wait",
+  "--text",
+  "Updated",
+  "--timeout",
+  "90000"
+ ],
+ [
+  "find",
+  "role",
+  "button",
+  "click",
+  "--name",
+  "Open S8 flow check"
+ ],
+ [
+  "wait",
+  "--text",
+  "Subagent of"
+ ],
+ [
+  "wait",
+  "--text",
+  "Which fixture color should I report?",
+  "--timeout",
+  "90000"
+ ],
+ [
+  "screenshot",
+  "/tmp/t3e2e-s8-flow-01-child-card.png"
+ ],
+ [
+  "find",
+  "role",
+  "button",
+  "click",
+  "--name",
+  "2. amber 2"
+ ],
+ [
+  "wait",
+  "--text",
+  "Review answers"
+ ],
+ [
+  "find",
+  "role",
+  "button",
+  "click",
+  "--name",
+  "Submit 1"
+ ],
+ [
+  "wait",
+  "--text",
+  "S8-ANSWER: amber",
+  "--timeout",
+  "90000"
+ ],
+ [
+  "screenshot",
+  "/tmp/t3e2e-s8-flow-02-child-answer.png"
+ ],
+ [
+  "wait",
+  "button[aria-label=\"Submit message\"]"
+ ],
+ [
+  "find",
+  "label",
+  "Message S8 flow check",
+  "fill",
+  "follow up seven"
+ ],
+ [
+  "find",
+  "role",
+  "button",
+  "click",
+  "--name",
+  "Submit message"
+ ],
+ [
+  "wait",
+  "--text",
+  "S8-FOLLOWUP: follow up seven",
+  "--timeout",
+  "90000"
+ ],
+ [
+  "screenshot",
+  "/tmp/t3e2e-s8-flow-03-child-followup.png"
+ ],
+ [
+  "find",
+  "role",
+  "button",
+  "click",
+  "--name",
+  "Open parent thread: t3e2e-s8 flow parent"
+ ],
+ [
+  "wait",
+  "--text",
+  "PARENT-WOKE: S8-FOLLOWUP: follow up seven",
+  "--timeout",
+  "90000"
+ ],
+ [
+  "wait",
+  "--text",
+  "PARENT-WOKE: S8-ANSWER: amber"
+ ],
+ [
+  "screenshot",
+  "/tmp/t3e2e-s8-flow-04-parent-woken-twice.png"
+ ]
+]
