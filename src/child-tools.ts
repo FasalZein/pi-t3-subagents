@@ -1,5 +1,6 @@
 /**
- * Child tool exposure at budget 0 (spec "Spawn policy and raw-delegation guard", D22).
+ * Child tool exposure (spec "Spawn policy and raw-delegation guard", D22): in every managed
+ * child, CHILD_REFUSED_TOOLS; at budget 0, also `subagent` and the thread-starting bridge tools.
  *
  * Leaves lose `subagent` and the thread-starting bridge tools through their launch
  * arguments (`--exclude-tools`, src/planner.ts). A spawning agent whose exact budget is 0
@@ -21,8 +22,27 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ChildRuntime, ChildState } from "./child-runtime.ts";
 import { THREAD_STARTING_TOOLS } from "./planner.ts";
 
+/**
+ * T3 bridge tools that start or schedule an agent thread, other than delegate_task and
+ * t3_thread_send. Refused in every managed child at any budget (owner decision 2026-10-26);
+ * list from the installed bridge catalog (T3 Nightly 2026-10-26).
+ */
+export const CHILD_REFUSED_TOOLS: readonly string[] = [
+	"create_threads",
+	"t3_thread_launch",
+	"t3_thread_fork",
+	"schedule_task",
+	"run_scheduled_task_now",
+	"update_scheduled_task",
+].map((t) => `mcp__t3-code__${t}`);
+
 /** Tools a child with budget 0 must not have active. */
-export const EXHAUSTED_TOOLS: readonly string[] = ["subagent", ...THREAD_STARTING_TOOLS];
+export const EXHAUSTED_TOOLS: readonly string[] = [...new Set(["subagent", ...THREAD_STARTING_TOOLS, ...CHILD_REFUSED_TOOLS])];
+
+/** Tools this child must not have active now: CHILD_REFUSED_TOOLS always, EXHAUSTED_TOOLS at budget 0. */
+export function removedTools(state: ChildState | undefined): readonly string[] {
+	return budgetExhausted(state) ? EXHAUSTED_TOOLS : CHILD_REFUSED_TOOLS;
+}
 
 /** Budget 0 (leaf, exhausted chain, or unreadable header). Undefined before the first input. */
 export function budgetExhausted(state: ChildState | undefined): boolean {
@@ -35,17 +55,16 @@ export const PRUNE_EVENTS = ["session_start", "model_select", "session_tree", "b
 export function installChildTools(pi: ExtensionAPI, child: ChildRuntime): { pruned(): number } {
 	let pruned = 0;
 	const prune = () => {
-		if (!budgetExhausted(child.state())) return;
+		const removed = removedTools(child.state());
 		const active = pi.getActiveTools();
-		const kept = active.filter((name) => !EXHAUSTED_TOOLS.includes(name));
+		const kept = active.filter((name) => !removed.includes(name));
 		if (kept.length === active.length) return;
 		pi.setActiveTools(kept);
 		pruned++;
 	};
 	for (const event of PRUNE_EVENTS) pi.on(event as any, async () => prune());
 	pi.on("before_provider_request", async (event) => {
-		if (!budgetExhausted(child.state())) return undefined;
-		const filtered = withoutExhaustedTools(event.payload);
+		const filtered = withoutExhaustedTools(event.payload, removedTools(child.state()));
 		if (filtered === event.payload) return undefined;
 		pruned++;
 		return filtered;
@@ -56,11 +75,11 @@ export function installChildTools(pi: ExtensionAPI, child: ChildRuntime): { prun
 /** Name of a serialized tool declaration: Anthropic/Responses `name`, Chat Completions `function.name`. */
 const declaredName = (tool: any): unknown => tool?.name ?? tool?.function?.name;
 
-/** The payload without exhausted tool declarations; the same object when nothing changes. */
-export function withoutExhaustedTools(payload: unknown): unknown {
+/** The payload without the `removed` tool declarations; the same object when nothing changes. */
+export function withoutExhaustedTools(payload: unknown, removed: readonly string[] = EXHAUSTED_TOOLS): unknown {
 	if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return payload;
 	const tools = (payload as { tools?: unknown }).tools;
 	if (!Array.isArray(tools)) return payload;
-	const kept = tools.filter((tool) => !EXHAUSTED_TOOLS.includes(declaredName(tool) as string));
+	const kept = tools.filter((tool) => !removed.includes(declaredName(tool) as string));
 	return kept.length === tools.length ? payload : { ...payload, tools: kept };
 }

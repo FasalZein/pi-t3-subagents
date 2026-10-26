@@ -144,13 +144,78 @@ describe("raw-delegation guard in a child thread", () => {
 			for (const tool of THREAD_STARTING_TOOLS) {
 				t.host.addTool(tool, "/t3/pi-mcp-bridge/index.ts", "deferred", false, () => ({ content: [], structuredContent: {} }));
 				const out = await t.host.callTool(tool, {}, { parentToolCallId: "call-cm" });
-				expect(out.blocked).toMatch(/may not start threads or tasks/);
+				// Other thread tools carry the every-child reason (owner decision 2026-10-26).
+				expect(out.blocked).toMatch(/may not start threads or tasks|is refused in a pi-t3-subagents child thread/);
 			}
 			const wrapper = await t.host.callTool("subagent", { ...base, agent: "fx-leaf" });
 			expect(wrapper.isError).toBe(true);
 			expect(t.bridge.calls).toEqual([]);
 		});
 	}
+});
+
+describe("owner decision 2026-10-26: other thread tools are refused in every child", () => {
+	const CREATE = "mcp__t3-code__create_threads";
+	const LAUNCH = "mcp__t3-code__t3_thread_launch";
+	const EXPECTED = ["create_threads", "t3_thread_launch", "t3_thread_fork", "schedule_task", "run_scheduled_task_now", "update_scheduled_task"].map((t) => `mcp__t3-code__${t}`);
+
+	/** A spawning child (budget 2) with every other thread tool active and direct, so the model can call it. */
+	async function spawnerWithThreadTools() {
+		const t = await thread({ caller: { agent: "fx-spawner", budget: 2 }, child: childOf({ budget: 2 }) });
+		for (const tool of EXPECTED) t.host.addTool(tool, "/t3/pi-mcp-bridge/index.ts", "direct", true, () => ({ content: [{ type: "text", text: "STARTED" }] }));
+		return t;
+	}
+
+	for (const tool of EXPECTED) {
+		test(`${tool.slice(14)}: refused from the model and from a codemode script`, async () => {
+			const t = await spawnerWithThreadTools();
+			const model = await t.host.callTool(tool, {});
+			expect(model.blocked).toMatch(/is refused in a pi-t3-subagents child thread .*only through the subagent tool/);
+			const script = await t.host.callTool(tool, {}, { parentToolCallId: "call-cm" });
+			expect(script.blocked).toMatch(/is refused in a pi-t3-subagents child thread/);
+		});
+	}
+
+	test("refused when nested in the wrapper's own in-flight subagent call", async () => {
+		const host = new FakePiHost();
+		const outcomes: any[] = [];
+		await host.load(OURS, (pi: ExtensionAPI) => {
+			// A wrapper stand-in named subagent that calls a thread tool through ctx.executeTool.
+			pi.registerTool({ name: "subagent", label: "s", description: "", parameters: {} as any, async execute(_id: string, params: any, _s: any, _u: any, ctx: any) {
+				outcomes.push(await ctx.executeTool(params.tool, {}));
+				return { content: [{ type: "text", text: "done" }], details: undefined };
+			} } as any);
+			installRawDelegationGuard(pi, { env: f.h.env, child: childOf({ budget: 2 }) });
+		});
+		for (const tool of [CREATE, LAUNCH]) host.addTool(tool, "/t3/pi-mcp-bridge/index.ts", "deferred", false, () => ({ content: [{ type: "text", text: "STARTED" }] }));
+		host.finishLoading();
+		for (const tool of [CREATE, LAUNCH]) await host.callTool("subagent", { tool });
+		expect(outcomes.map((o) => o.blocked ?? JSON.stringify(o.result))).toEqual([CREATE, LAUNCH].map((t) => expect.stringMatching(new RegExp(`^${t} is refused in a pi-t3-subagents child thread`))));
+	});
+
+	test("a spawning child (budget above 0) loses them from the active set and the provider request; spawn tools stay", async () => {
+		const host = new FakePiHost();
+		await host.load(OURS, (pi: ExtensionAPI) => {
+			installChildTools(pi, childOf({ budget: 2 }));
+		});
+		host.addTool("subagent", OURS, "direct", true);
+		for (const tool of [DELEGATE, SEND, CREATE, LAUNCH]) host.addTool(tool, "/t3/pi-mcp-bridge/index.ts", "direct", true);
+		host.finishLoading();
+		await host.startSession();
+		await host.emit("turn_start", {});
+		expect([...host.active].sort()).toEqual([DELEGATE, SEND, "subagent"].sort());
+		const [replaced] = await host.emit("before_provider_request", { payload: { tools: [{ name: DELEGATE }, { name: CREATE }, { type: "function", function: { name: LAUNCH } }] } });
+		expect(replaced).toEqual({ tools: [{ name: DELEGATE }] });
+	});
+
+	test("root threads keep them", async () => {
+		const t = await thread({ caller: { agent: null, budget: null }, managed: ["t3t-fx-leaf"] });
+		for (const tool of [CREATE, LAUNCH]) {
+			t.host.addTool(tool, "/t3/pi-mcp-bridge/index.ts", "direct", true, () => ({ content: [{ type: "text", text: "STARTED" }] }));
+			expect((await t.host.callTool(tool, {})).blocked).toBeUndefined();
+			expect((await t.host.callTool(tool, {}, { parentToolCallId: "call-cm" })).blocked).toBeUndefined();
+		}
+	});
 });
 
 describe("raw-delegation guard in a root thread", () => {

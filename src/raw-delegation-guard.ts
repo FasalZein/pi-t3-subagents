@@ -3,6 +3,10 @@
  * not a security sandbox.
  *
  * A `tool_call` handler:
+ * - In every managed child, at any budget: T3's other bridge tools that start or schedule an
+ *   agent thread (CHILD_REFUSED_TOOLS) are refused, from the model, from codemode and nested
+ *   in the wrapper's own call (owner decision 2026-10-26). Children start threads only
+ *   through `subagent`.
  * - In a managed child at budget 0 (leaves, exhausted chains): every thread-starting bridge
  *   tool is refused.
  * - In a managed child: `mcp__t3-code__delegate_task` passes only when its
@@ -21,7 +25,7 @@
 import { readFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ChildRuntime } from "./child-runtime.ts";
-import { budgetExhausted } from "./child-tools.ts";
+import { budgetExhausted, CHILD_REFUSED_TOOLS } from "./child-tools.ts";
 import type { CompatibilityCheck } from "./doctor.ts";
 import { BRIDGE_DELEGATE } from "./launch-planner.ts";
 import { THREAD_STARTING_TOOLS } from "./planner.ts";
@@ -32,6 +36,8 @@ export const WRAPPER_TOOL = "subagent";
 
 export const REFUSED_EXHAUSTED = (tool: string) =>
 	`${tool} is refused: this agent may not start threads or tasks (leaf agent or spawn budget exhausted, D22).`;
+export const REFUSED_CHILD_THREAD_TOOL = (tool: string) =>
+	`${tool} is refused in a pi-t3-subagents child thread (D22, owner decision 2026-10-26). Children start threads only through the subagent tool.`;
 export const REFUSED_CHILD_RAW =
 	"Raw delegate_task is refused in a pi-t3-subagents child thread (D22). Launch agents with the subagent tool; it applies spawning, visibility and the spawn budget.";
 export const REFUSED_ROOT_MANAGED = (id: string) =>
@@ -65,6 +71,7 @@ export function managedInstanceReader(env: Record<string, string | undefined>): 
 }
 
 const STARTING = new Set(THREAD_STARTING_TOOLS);
+const CHILD_REFUSED = new Set(CHILD_REFUSED_TOOLS);
 
 export function installRawDelegationGuard(pi: ExtensionAPI, deps: GuardDeps): RawDelegationGuard {
 	const isManaged = deps.isManagedInstance ?? managedInstanceReader(deps.env);
@@ -84,6 +91,10 @@ export function installRawDelegationGuard(pi: ExtensionAPI, deps: GuardDeps): Ra
 
 	pi.on("tool_call", async (event: any) => {
 		const name: string = event?.toolName;
+		if (deps.child && CHILD_REFUSED.has(name)) {
+			refused++;
+			return { block: true, reason: REFUSED_CHILD_THREAD_TOOL(name) };
+		}
 		if (!STARTING.has(name)) return undefined;
 		const parent: unknown = event.parentToolCallId;
 		const fromWrapper = typeof parent === "string" && inFlight.has(parent);
