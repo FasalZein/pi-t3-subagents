@@ -440,7 +440,7 @@ export function itemText(item: LaunchItem, options: { interactive?: boolean } = 
 			: "The child runs in its own T3 thread. Completion wakes this thread; end your turn now.",
 		finished: `The child already finished [${item.status}]; no wake will come. Its reply:\n${item.summary ?? "(no reply text)"}`,
 		// U19 (live S4): a completion wake follows a wait that ended on a question.
-		waiting: `The child waits for input in its thread (question or approval). ${ANSWER_IN_CHILD} When the child finishes, a completion wake comes.`,
+		waiting: `The child waits for input in its thread (question or approval). ${ANSWER_IN_CHILD}`,
 		wait_timed_out: "The wait reached its limit. The child still runs; a wake comes when it finishes.",
 	};
 	const args = {
