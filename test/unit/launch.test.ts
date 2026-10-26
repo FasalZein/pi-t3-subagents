@@ -343,8 +343,12 @@ test("first message: without task-expansion, shell blocks stay as written", asyn
 	expect(text).toContain("Inline: !`echo X`");
 });
 
-test("children[] is refused until batches land (S4)", async () => {
+test("children[]: a batch launches each child with the single-launch arguments and its own key (S4)", async () => {
 	const bridge = f.bridge();
-	await expect(f.run(f.tool(), bridge, { children: [{ ...base, agent: "fx-leaf" }] })).rejects.toThrow(/children\[\] batches are not supported/);
-	expect(bridge.calls).toEqual([]);
+	const children = [{ ...base, agent: "fx-leaf" }, { ...base, name: "fx-other", agent: "fx-leaf" }];
+	const result = await f.run(f.tool(), bridge, { children });
+	expect(bridge.calls.map((c) => c.args.clientRequestId)).toEqual([launchKey("call-1", 0, children[0]!), launchKey("call-1", 1, children[1]!)]);
+	expect(bridge.calls[0]!.args.target).toEqual({ providerInstanceId: "t3t-fx-leaf", model: "default", options: {} });
+	expect(result.structuredContent.launches).toHaveLength(2);
+	expect(result.details).toBeUndefined();
 });
