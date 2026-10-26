@@ -31,6 +31,7 @@ import { type LaunchOutcome, subagentToolFor } from "./src/subagent-tool.ts";
 import { registerSyncCommand } from "./src/sync-command.ts";
 import { installTakeover, isInsideT3, takeoverChecks } from "./src/takeover.ts";
 import { installManagedChildTools } from "./src/managed-child-tools.ts";
+import { installCallerPing } from "./src/caller-ping.ts";
 
 type Env = Record<string, string | undefined>;
 
@@ -64,6 +65,7 @@ export function createExtension(env: Env = process.env, copyId: string = import.
 		// that owns the takeover, so a second copy cannot register a duplicate tool or a second timer.
 		installManagedChildTools(pi, child, takeover, [
 			// [slot S6] caller_ping and its run latch: begin
+			installCallerPing,
 			// [slot S6] end
 			// [slot S7] context warnings and time limit: begin
 			// [slot S7] end
