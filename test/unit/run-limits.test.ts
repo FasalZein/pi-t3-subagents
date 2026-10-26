@@ -3,7 +3,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createExtension } from "../../index.ts";
 import type { ChildRuntime } from "../../src/child-runtime.ts";
-import { type Clock, CONTEXT_WARNINGS_ENTRY, installRunLimits, RUN_LIMIT_ENTRY } from "../../src/run-limits.ts";
+import { type Clock, CONTEXT_WARNINGS_ENTRY, installRunLimits, RUN_LIMIT_ENTRY, TIME_WARNING_TYPE } from "../../src/run-limits.ts";
 import { resetCopyRegistry } from "../../src/takeover.ts";
 import { FakePiHost } from "../harness/fake-pi.ts";
 import { tempHost, type TempHost } from "./sync-helpers.ts";
@@ -46,7 +46,8 @@ class FakeClock implements Clock {
 interface Rig {
 	host: FakePiHost;
 	clock: FakeClock;
-	steers: Array<{ text: string; deliverAs?: string }>;
+	/** Steers in send order; a time-limit warning keeps the custom message Pi would record. */
+	steers: Array<{ text: string; deliverAs?: string; message?: Record<string, unknown> }>;
 	aborts: number[];
 	usage: { percent: number };
 	fields: Record<string, string>;
@@ -65,7 +66,12 @@ async function rig(fields: Record<string, string>, options: { lateFire?: boolean
 		getContextUsage: () => ({ tokens: usage.percent * 2000, contextWindow: 200_000, percent: usage.percent }),
 	};
 	await host.load(OURS, (pi: ExtensionAPI) => {
-		const api = { ...pi, sendUserMessage: (text: string, o?: { deliverAs?: string }) => steers.push({ text, deliverAs: o?.deliverAs }) } as unknown as ExtensionAPI;
+		const api = {
+			...pi,
+			sendUserMessage: (text: string, o?: { deliverAs?: string }) => steers.push({ text, deliverAs: o?.deliverAs }),
+			sendMessage: (m: { content: string }, o?: { deliverAs?: string }) =>
+				steers.push({ text: m.content, deliverAs: o?.deliverAs, message: { role: "custom", ...m, timestamp: 0 } }),
+		} as unknown as ExtensionAPI;
 		installRunLimits(api, child, () => ({ fields: r.fields }), clock);
 	});
 	await host.startSession();
@@ -175,33 +181,57 @@ test("run A schedules, run B starts, A's timer fires late: A cannot warn or abor
 	expect(r.aborts).toEqual([110_000]);
 });
 
-test("a warning that Pi records only after the abort is removed from later model requests, also after a reload", async () => {
+/** Pi records a delivered time-limit warning (custom message) in the transcript. */
+const deliverWarning = (r: Rig, i: number) => r.host.emit("message_end", { message: r.steers[i].message }, r.ctx);
+const modelRequest = async (r: Rig, messages: unknown[]) => {
+	const [result] = (await r.host.emit("context", { messages }, r.ctx)) as any[];
+	return (result?.messages ?? messages) as unknown[];
+};
+
+test("the time-limit warning is a custom message with a unique id per occurrence", async () => {
 	const r = await rig({ timeout: "100", "timeout-warn-threshold": "50" });
 	await runStart(r);
 	at(r, 50);
-	at(r, 100); // the steer is still queued behind a long tool call when the run stops
-	const warning = r.steers[0].text;
-	await deliver(r, warning); // Pi flushes it into the transcript after the abort
 	await settle(r);
-	const user = (text: string) => ({ role: "user", content: [{ type: "text", text }] });
-	const transcript = [user("task"), { role: "assistant", content: [] }, user(warning), user("follow-up")];
-	const [result] = (await r.host.emit("context", { messages: transcript }, r.ctx)) as any[];
-	expect(result.messages.map((m: any) => m.content[0]?.text)).toEqual(["task", undefined, "follow-up"]);
-	// After a reload the saved entry keeps the filter.
+	await runStart(r);
+	at(r, 100);
+	expect(r.steers.map((x) => x.message?.customType)).toEqual([TIME_WARNING_TYPE, TIME_WARNING_TYPE]);
+	expect(r.steers[0].text).toBe(r.steers[1].text);
+	const ids = r.steers.map((x) => (x.message?.details as { id: string }).id);
+	expect(new Set(ids).size).toBe(2);
+});
+
+test("a warning recorded after its run stopped is hidden; a later identical warning and an identical user message stay, also after a reload", async () => {
+	const r = await rig({ timeout: "100", "timeout-warn-threshold": "50" });
+	// Run A: the steer is still queued behind a long tool call when the run stops.
+	await runStart(r);
+	at(r, 50);
+	at(r, 100);
+	await deliverWarning(r, 0); // Pi flushes it into the transcript after the abort
+	await settle(r);
+	// Run B: the same warning text, delivered while B is live.
+	await runStart(r);
+	at(r, 150);
+	await deliverWarning(r, 1);
+	const text = r.steers[0].text;
+	expect(r.steers[1].text).toBe(text);
+	const user = { role: "user", content: [{ type: "text", text }, { type: "image", data: "x", mimeType: "image/png" }] };
+	const transcript = [{ role: "user", content: "task" }, r.steers[0].message, { role: "user", content: "follow-up" }, user, r.steers[1].message];
+	const expected = [transcript[0], transcript[2], user, r.steers[1].message];
+	expect(await modelRequest(r, transcript)).toEqual(expected);
+	// Reload: the saved entries keep exactly the same filter.
 	resetCopyRegistry();
 	const next = await rig({}, { entries: r.host.entries });
-	const [again] = (await next.host.emit("context", { messages: transcript }, next.ctx)) as any[];
-	expect(again.messages).toHaveLength(3);
+	expect(await modelRequest(next, transcript)).toEqual(expected);
 });
 
 test("a warning delivered while its run is live stays in the transcript", async () => {
 	const r = await rig({ timeout: "100", "timeout-warn-threshold": "50" });
 	await runStart(r);
 	at(r, 50);
-	await deliver(r, r.steers[0].text);
-	const transcript = [{ role: "user", content: [{ type: "text", text: r.steers[0].text }] }];
-	const [result] = (await r.host.emit("context", { messages: transcript }, r.ctx)) as any[];
-	expect(result).toBeUndefined();
+	await deliverWarning(r, 0);
+	const transcript = [r.steers[0].message];
+	expect(await modelRequest(r, transcript)).toEqual(transcript);
 });
 
 test("session_shutdown clears the timers of the active run", async () => {

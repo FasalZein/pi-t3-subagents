@@ -19,6 +19,7 @@
  * Installed through installManagedChildTools (slot S7 in index.ts): only in a managed
  * child, and only in the copy that owns the takeover, so one runtime has one timer set.
  */
+import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AgentDefinition } from "./catalog.ts";
 import type { ChildRuntime } from "./child-runtime.ts";
@@ -29,11 +30,17 @@ export const CONTEXT_WARNINGS_ENTRY = "pi-t3-subagents-context-warnings";
 /** Session entry written when the time limit stops a run. */
 export const RUN_LIMIT_ENTRY = "pi-t3-subagents-run-limit";
 /**
- * Session entry naming a time-limit warning that Pi recorded only after its run was stopped.
- * Observed live (Pi 1.4.0 in T3, 2026-10-26): a steer still queued at the abort is written
- * into the transcript after the aborted tool result. The model of that run never saw it,
- * and a follow-up run would read "N s remain" as current. Such warnings are removed from
- * later model requests through the `context` event; the session file keeps them.
+ * The time-limit warning is a custom message of this type (Pi sends its content to the model
+ * as user text). `details.id` is unique per warning and is saved with the message in the
+ * session, so one warning occurrence can be told apart from another with the same text.
+ */
+export const TIME_WARNING_TYPE = "pi-t3-subagents-time-warning";
+/**
+ * Session entry naming (by id) a time-limit warning that Pi recorded only after its run was
+ * stopped. Observed live (Pi 1.4.0 in T3, 2026-10-26): a steer still queued at the abort is
+ * written into the transcript after the aborted tool result. The model of that run never saw
+ * it, and a follow-up run would read "N s remain" as current. Only those occurrences are
+ * removed from later model requests (`context` event); the session file keeps them.
  */
 export const STALE_WARNING_ENTRY = "pi-t3-subagents-stale-time-warning";
 
@@ -209,6 +216,13 @@ function messageText(message: unknown): string | undefined {
 		.join("\n");
 }
 
+/** The occurrence id of a time-limit warning message; undefined for any other message. */
+function timeWarningId(message: unknown): string | undefined {
+	const m = message as { role?: unknown; customType?: unknown; details?: { id?: unknown } };
+	if (m?.role !== "custom" || m.customType !== TIME_WARNING_TYPE) return undefined;
+	return typeof m.details?.id === "string" ? m.details.id : undefined;
+}
+
 /** The installer for slot S7: context warnings and the time limit in a managed child. */
 export function runLimitsInstaller(definition: DefinitionGetter, clock: Clock = realClock): ManagedChildToolInstaller {
 	return (pi: ExtensionAPI, child: ChildRuntime) => installRunLimits(pi, child, definition, clock);
@@ -221,8 +235,8 @@ export function installRunLimits(pi: ExtensionAPI, child: ChildRuntime, definiti
 	const sent = new Set<number>();
 	const pending = new Set<number>();
 	const pendingMessages = new Map<string, number[]>();
-	// Time-limit warnings sent but not yet in the transcript, by generation id; and the
-	// warnings that reached the transcript only after their run was stopped.
+	// Time-limit warning ids sent but not yet in the transcript (-> generation id), and the
+	// ids of warnings that reached the transcript only after their run was stopped.
 	const undeliveredWarnings = new Map<string, number>();
 	const staleWarnings = new Set<string>();
 
@@ -256,8 +270,9 @@ export function installRunLimits(pi: ExtensionAPI, child: ChildRuntime, definiti
 				clock.setTimeout(() => {
 					if (!live()) return;
 					const text = timeoutWarning(timeoutSeconds, Math.round((clock.now() - generation.startedAt) / MS_PER_SECOND));
-					undeliveredWarnings.set(text, generation.id);
-					steer(text);
+					const id = randomUUID();
+					undeliveredWarnings.set(id, generation.id);
+					pi.sendMessage({ customType: TIME_WARNING_TYPE, content: text, display: true, details: { id } }, { deliverAs: "steer" });
 				}, (limitMs * timeoutWarnThreshold) / 100),
 			);
 		}
@@ -299,7 +314,7 @@ export function installRunLimits(pi: ExtensionAPI, child: ChildRuntime, definiti
 		pendingMessages.clear();
 		const entries = ((ctx as Ctx)?.sessionManager?.getEntries?.() ?? []) as any[];
 		for (const e of entries)
-			if (e?.type === "custom" && e.customType === STALE_WARNING_ENTRY && typeof e.data?.text === "string") staleWarnings.add(e.data.text);
+			if (e?.type === "custom" && e.customType === STALE_WARNING_ENTRY && typeof e.data?.id === "string") staleWarnings.add(e.data.id);
 		const saved = entries.filter((e) => e?.type === "custom" && e.customType === CONTEXT_WARNINGS_ENTRY && Array.isArray(e.data?.sentThresholds)).at(-1);
 		for (const level of saved?.data.sentThresholds ?? []) if (typeof level === "number") sent.add(level);
 	});
@@ -309,16 +324,19 @@ export function installRunLimits(pi: ExtensionAPI, child: ChildRuntime, definiti
 	});
 
 	pi.on("message_end", async (event) => {
-		const text = messageText((event as any).message);
-		const warningGeneration = text === undefined ? undefined : undeliveredWarnings.get(text);
-		if (warningGeneration !== undefined) {
-			undeliveredWarnings.delete(text as string);
+		const message = (event as any).message;
+		const warningId = timeWarningId(message);
+		if (warningId !== undefined) {
+			const warningGeneration = undeliveredWarnings.get(warningId);
+			if (warningGeneration === undefined) return;
+			undeliveredWarnings.delete(warningId);
 			if (current?.id !== warningGeneration) {
-				staleWarnings.add(text as string);
-				pi.appendEntry(STALE_WARNING_ENTRY, { text });
+				staleWarnings.add(warningId);
+				pi.appendEntry(STALE_WARNING_ENTRY, { id: warningId });
 			}
 			return;
 		}
+		const text = messageText(message);
 		const levels = text === undefined ? undefined : pendingMessages.get(text);
 		if (!levels) return;
 		pendingMessages.delete(text as string);
@@ -351,8 +369,8 @@ export function installRunLimits(pi: ExtensionAPI, child: ChildRuntime, definiti
 		if (staleWarnings.size === 0) return;
 		const messages: any[] = (event as any).messages ?? [];
 		const kept = messages.filter((m) => {
-			const text = messageText(m);
-			return text === undefined || !staleWarnings.has(text);
+			const id = timeWarningId(m);
+			return id === undefined || !staleWarnings.has(id);
 		});
 		if (kept.length !== messages.length) return { messages: kept };
 	});
