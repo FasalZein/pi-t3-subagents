@@ -12,6 +12,14 @@ export interface BridgeCall {
 
 type Responder = (args: any) => unknown;
 
+/** Where the fake bridge's tools come from when installed on a FakePiHost. */
+export const BRIDGE_PATH = "/t3/pi-mcp-bridge/index.ts";
+
+/** The FakePiHost surface the bridge needs (kept structural to avoid an import cycle). */
+interface ToolHost {
+	addTool(name: string, path: string, exposure?: "direct" | "codemode" | "deferred", active?: boolean, execute?: (toolCallId: string, args: any) => unknown): void;
+}
+
 export class FakeBridge {
 	readonly calls: BridgeCall[] = [];
 	private readonly responders = new Map<string, Responder>();
@@ -35,18 +43,34 @@ export class FakeBridge {
 			cwd: "/tmp",
 			tools: [...this.responders.keys()].map((name) => ({ name })),
 			executeTool: async (name: string, args: unknown) => {
-				this.calls.push({ name, args });
-				const responder = this.responders.get(name);
-				if (!responder) throw new Error(`Tool ${name} not found`);
-				const data: any = await responder(args);
-				if (data && typeof data === "object" && "__mcpError" in data) {
-					const content = [{ type: "text", text: data.__mcpError }];
-					return { isError: false, result: { content, structuredContent: { isError: true, content } } };
+				if (!this.responders.has(name)) {
+					this.calls.push({ name, args });
+					throw new Error(`Tool ${name} not found`);
 				}
-				const content = [{ type: "text", text: JSON.stringify(data) }];
-				return { isError: false, result: { content, structuredContent: { content, structuredContent: data } } };
+				return { isError: false, result: await this.answer(name, args) };
 			},
 			...extra,
 		};
+	}
+
+	/**
+	 * Register every answered tool on a FakePiHost (deferred, as the T3 bridge exposes its
+	 * tools), so a ctx.executeTool call goes through the host's tool pipeline: `tool_call`
+	 * guards, `tool_result` and execution events with `parentToolCallId`. Call after respond().
+	 */
+	installOn(host: ToolHost, exposure: "direct" | "codemode" | "deferred" = "deferred"): this {
+		for (const name of this.responders.keys()) host.addTool(name, BRIDGE_PATH, exposure, false, (_id, args) => this.answer(name, args));
+		return this;
+	}
+
+	private async answer(name: string, args: unknown): Promise<any> {
+		this.calls.push({ name, args });
+		const data: any = await this.responders.get(name)?.(args);
+		if (data && typeof data === "object" && "__mcpError" in data) {
+			const content = [{ type: "text", text: data.__mcpError }];
+			return { content, structuredContent: { isError: true, content } };
+		}
+		const content = [{ type: "text", text: JSON.stringify(data) }];
+		return { content, structuredContent: { content, structuredContent: data } };
 	}
 }

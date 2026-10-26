@@ -6,17 +6,17 @@
  *
  * Writes go through the settings writer only. Entries outside the namespace
  * are never changed. The test main instance loads this worktree's extension
- * and points PI_T3_AGENTS_DIR at the repository fixture agents.
+ * and points PI_T3_AGENTS_DIR at the repository fixture agents: the slice's own
+ * folder test/fixtures/agents-<slice>/ when it exists, else the shared
+ * test/fixtures/agents/ (scripts/fixture-agents.ts).
  */
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { mainInstanceId, quoteArg } from "../src/planner.ts";
 import { MANAGED_BY, type ProviderInstanceEntry, type Settings, settingsShapeProblems } from "../src/settings-shape.ts";
 import { writeSettings } from "../src/settings-writer.ts";
 import { EXTENSION_ENTRY } from "../src/sync-command.ts";
 import { settingsPath, stateDir } from "../src/sync.ts";
-
-const FIXTURE_AGENTS = join(import.meta.dir, "..", "test", "fixtures", "agents");
+import { fixtureAgentsDir } from "./fixture-agents.ts";
 const MAIN_MODEL = "cpa/claude-haiku-5-5";
 
 const [command, slice] = process.argv.slice(2);
@@ -25,6 +25,7 @@ if (!["setup", "teardown"].includes(command ?? "") || !/^[a-z0-9]+$/.test(slice 
 	process.exit(2);
 }
 const namespace = `t3e2e-${slice}-`;
+const agentsDir = fixtureAgentsDir(slice as string);
 const path = settingsPath();
 const originalText = readFileSync(path, "utf8");
 const settings: Settings = JSON.parse(originalText);
@@ -41,7 +42,7 @@ if (command === "setup") {
 		enabled: true,
 		environment: [
 			{ name: "PI_T3_NAMESPACE", value: namespace, sensitive: false },
-			{ name: "PI_T3_AGENTS_DIR", value: FIXTURE_AGENTS, sensitive: false },
+			{ name: "PI_T3_AGENTS_DIR", value: agentsDir, sensitive: false },
 		],
 		config: {
 			binaryPath,
@@ -69,5 +70,5 @@ const outcome = await writeSettings({
 	},
 });
 const after = Object.keys(JSON.parse(readFileSync(path, "utf8")).providerInstances ?? {}).filter((id) => id.startsWith(namespace));
-console.log(JSON.stringify({ command, namespace, extension: EXTENSION_ENTRY, before, after, outcome }, null, 2));
+console.log(JSON.stringify({ command, namespace, extension: EXTENSION_ENTRY, agentsDir, before, after, outcome }, null, 2));
 process.exit(outcome.status === "written" ? 0 : 1);

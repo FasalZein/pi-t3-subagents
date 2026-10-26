@@ -9,6 +9,12 @@
  * - src/roster.ts: the agent roster for the parent model (D30).
  * - src/child-runtime.ts: env, prompt strip, header and revision check in a child (S3).
  * - src/sync-command.ts: `/t3-sync-agents` (S2); src/doctor-checks.ts: C6 and C7; src/launch-checks.ts: C4 and C8.
+ * - src/managed-child-tools.ts: managed-child tools install only in the copy that owns the takeover.
+ *
+ * Slice slots (spec "Delivery Slices", ownership table): S4-S8 each add their wiring only
+ * inside their own marked slot below, and their imports at the end of the import list.
+ * Slots follow the landing order S5, S4, S6, S7, S8. Keep the child runtime first and the
+ * slot order as is. Register compatibility checks through doctor.register inside the slot.
  *
  * Outside T3 Code (T3_MCP_URL or T3_MCP_BEARER_TOKEN unset) the extension registers no
  * tool and changes no environment; only the doctor and sync commands exist (A7).
@@ -24,6 +30,7 @@ import { installRoster } from "./src/roster.ts";
 import { type LaunchOutcome, subagentToolFor } from "./src/subagent-tool.ts";
 import { registerSyncCommand } from "./src/sync-command.ts";
 import { installTakeover, isInsideT3, takeoverChecks } from "./src/takeover.ts";
+import { installManagedChildTools } from "./src/managed-child-tools.ts";
 
 type Env = Record<string, string | undefined>;
 
@@ -49,6 +56,20 @@ export function createExtension(env: Env = process.env, copyId: string = import.
 				callerAgent: child?.state()?.agent ?? null,
 				enabled: takeover.state().kind === "registered",
 			}));
+		// [slot S5] nested policy, raw-delegation guard, child tool exposure: begin
+		// [slot S5] end
+		// [slot S4] batches, synchronous calls, width ledger (C5): begin
+		// [slot S4] end
+		// Managed-child tools and child-run handlers: only in a managed child, only in the copy
+		// that owns the takeover, so a second copy cannot register a duplicate tool or a second timer.
+		installManagedChildTools(pi, child, takeover, [
+			// [slot S6] caller_ping and its run latch: begin
+			// [slot S6] end
+			// [slot S7] context warnings and time limit: begin
+			// [slot S7] end
+		]);
+		// [slot S8] interactive agents: begin
+		// [slot S8] end
 		for (const check of takeoverChecks(takeover)) doctor.register(check);
 		doctor.register(bridgeToolsCheck(pi));
 		doctor.register(launchContractCheck(() => lastLaunch));

@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import { createExtension } from "../../index.ts";
+import { FIXTURES_ROOT, fixtureAgentsDir, SHARED_AGENTS, sliceAgentDirs } from "../../scripts/fixture-agents.ts";
 import { c6SettingsShape, c7LaunchArgs } from "../../src/doctor-checks.ts";
 import { runSync } from "../../src/sync.ts";
 import { acquireLock, writeSettings } from "../../src/settings-writer.ts";
@@ -272,18 +273,52 @@ describe("ownership and namespaces", () => {
 });
 
 describe("repository fixture agents", () => {
-	test("the live-test fixtures plan without a skip in a namespace and keep their dummy secret out", async () => {
-		const h = host("t3e2e-s2-");
-		const fixtures = join(import.meta.dir, "..", "fixtures", "agents");
-		const env = { ...h.env, PI_T3_AGENTS_DIR: fixtures };
-		h.writeSettings({ providerInstances: { "t3e2e-s2-main": mainEntry(h) } });
+	const SHARED_IDS = ["t3e2e-s2-fx-env", "t3e2e-s2-fx-ext", "t3e2e-s2-fx-interactive", "t3e2e-s2-fx-leaf", "t3e2e-s2-fx-spawner", "t3e2e-s2-fx-sync", "t3e2e-s2-main"];
+
+	/** Sync the agents of `dir` into a fresh namespace `t3e2e-<slice>-`; return the report and the instance ids. */
+	async function syncFixtures(dir: string, slice = "s2") {
+		const namespace = `t3e2e-${slice}-`;
+		const h = host(namespace);
+		const env = { ...h.env, PI_T3_AGENTS_DIR: dir };
+		h.writeSettings({ providerInstances: { [`${namespace}main`]: mainEntry(h) } });
 		const report = await runSync({ args: "--yes", env, extensionPath: h.extensionPath, ui: noUi, reloadWaitMs: 0 });
+		return { h, report, ids: Object.keys(h.readSettings().providerInstances).sort() };
+	}
+
+	test("the live-test fixtures plan without a skip in a namespace and keep their dummy secret out", async () => {
+		const { h, report, ids } = await syncFixtures(fixtureAgentsDir("s2"));
 		expect(report.status).toBe("written");
 		expect(report.plan?.skipped).toEqual([]);
-		const ids = Object.keys(h.readSettings().providerInstances).sort();
-		expect(ids).toEqual(["t3e2e-s2-fx-env", "t3e2e-s2-fx-ext", "t3e2e-s2-fx-interactive", "t3e2e-s2-fx-leaf", "t3e2e-s2-fx-spawner", "t3e2e-s2-fx-sync", "t3e2e-s2-main"]);
+		expect(ids).toEqual(SHARED_IDS);
 		expect(h.settingsText()).not.toContain("fixture-dummy-secret-0000");
 		expect(report.text).toContain("gap fx-env: env: PI_OFFLINE");
+	});
+
+	test("a fixture in a slice folder changes neither the shared folder's inventory nor another slice's selection", async () => {
+		// A copy of the repository fixture tree plus one new slice folder, as a slice would add it.
+		const root = join(host().root, "fixtures");
+		mkdirSync(root);
+		cpSync(join(FIXTURES_ROOT, SHARED_AGENTS), join(root, SHARED_AGENTS), { recursive: true });
+		mkdirSync(join(root, "agents-s9"));
+		writeFileSync(join(root, "agents-s9", "fx-new.md"), "---\nname: fx-new\ndescription: New slice fixture\nmodel: cpa/claude-haiku-5-5\n---\n\nYou are a test agent.\n");
+
+		expect(fixtureAgentsDir("s9", root)).toBe(join(root, "agents-s9"));
+		expect(fixtureAgentsDir("s4", root)).toBe(join(root, SHARED_AGENTS));
+		expect(sliceAgentDirs(root)).toEqual([["s9", join(root, "agents-s9")]]);
+		const shared = await syncFixtures(fixtureAgentsDir("s2", root));
+		expect(shared.report.plan?.skipped).toEqual([]);
+		expect(shared.ids).toEqual(SHARED_IDS);
+		const own = await syncFixtures(fixtureAgentsDir("s9", root), "s9");
+		expect(own.ids).toEqual(["t3e2e-s9-fx-new", "t3e2e-s9-main"]);
+	});
+
+	// Each S4-S8 slice that adds test/fixtures/agents-<slice>/ is checked here without a new test.
+	test("every slice fixture folder plans without a skip in its own namespace", async () => {
+		for (const [slice, dir] of sliceAgentDirs()) {
+			const { report, ids } = await syncFixtures(dir, slice);
+			expect({ slice, status: report.status, skipped: report.plan?.skipped }).toEqual({ slice, status: "written", skipped: [] });
+			expect(ids.length).toBeGreaterThan(1);
+		}
 	});
 });
 

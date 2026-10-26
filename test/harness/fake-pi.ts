@@ -8,8 +8,19 @@
  * - registering a `direct` or `model-only` tool activates it; other exposures stay inactive;
  * - setActiveTools ignores unknown names;
  * - a tool call (model-issued, or nested through ctx.executeTool with parentToolCallId)
- *   runs the `tool_call` handlers first, and a `block` result stops it. A nested call
- *   reaches active `direct` tools and every `codemode` or `deferred` tool.
+ *   reaches only callable tools: a model call active tools, a nested call active `direct`
+ *   tools and every `codemode` or `deferred` tool;
+ * - a tool call runs the Pi 1.4.0 pipeline (pi-agent-core agent-loop.js, pi-coding-agent
+ *   nested-tool-calls.js and agent-session.js _beforeToolCall/_afterToolCall):
+ *   `tool_execution_start` -> `tool_call` handlers (a `block` or a thrown error stops the
+ *   call) -> abort check -> execute (`tool_execution_update` per partial result) ->
+ *   `tool_result` handlers (they may replace content, details and isError) ->
+ *   `tool_execution_end`. A blocked, aborted or unknown call skips `tool_result`.
+ *   Tool failures never reject: they come back as `isError: true` with the error text;
+ * - ctx.executeTool in execute() runs a nested call with the id `<calling id>/<n>`, and every
+ *   event of that call carries `parentToolCallId`; it defaults to the caller's abort signal;
+ * - pi.appendEntry adds a `custom` session entry; ctx.sessionManager.getEntries() returns
+ *   the session entries, which a test may share between hosts to model /reload or resume.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -34,6 +45,32 @@ export interface Notification {
 }
 
 type Handler = (event: any, ctx: any) => unknown;
+type Execute = (toolCallId: string, args: any, signal: AbortSignal | undefined, onUpdate: ((partial: any) => void) | undefined, ctx: any) => unknown;
+
+/** A session entry as Pi's SessionManager stores it (only the fields this repository reads). */
+export interface FakeSessionEntry {
+	type: string;
+	id?: string;
+	customType?: string;
+	data?: unknown;
+	message?: { role: string; content: unknown };
+	timestamp?: string;
+}
+
+/** Pi's AgentToolCallOutcome, plus the block reason when a `tool_call` handler blocked it. */
+export interface FakeToolOutcome {
+	toolCall: { id: string; name: string; arguments: unknown };
+	result: any;
+	isError: boolean;
+	blocked?: string;
+}
+
+export interface CallOptions {
+	/** Set for a nested call: the id of the calling tool call. */
+	parentToolCallId?: string;
+	signal?: AbortSignal;
+	onUpdate?: (partial: any) => void;
+}
 type Factory = (pi: ExtensionAPI) => void | Promise<void>;
 
 export class FakeLoadError extends Error {}
@@ -46,7 +83,17 @@ export class FakePiHost {
 	readonly messages: SentMessage[] = [];
 	readonly notifications: Notification[] = [];
 	readonly loadErrors: string[] = [];
+	/** Session entries (`custom` entries from appendEntry, and messages a test adds). */
+	readonly entries: FakeSessionEntry[];
+	/** Every tool lifecycle event this host emitted, in order. */
+	readonly toolEvents: Array<Record<string, any>> = [];
 	private loading = true;
+	private modelCalls = 0;
+	private readonly nestedCounts = new Map<string, number>();
+
+	constructor(options: { entries?: FakeSessionEntry[] } = {}) {
+		this.entries = options.entries ?? [];
+	}
 
 	/** Load an extension factory as Pi does, attributing its registrations to `path`. */
 	async load(path: string, factory: Factory): Promise<void> {
@@ -61,8 +108,8 @@ export class FakePiHost {
 	}
 
 	/** Register a tool that Pi or the MCP bridge provides, outside any factory. */
-	addTool(name: string, path: string, exposure: Exposure = "direct", active = exposure === "direct"): void {
-		this.tools.set(name, { name, exposure, sourceInfo: sourceInfo(path), definition: { name } });
+	addTool(name: string, path: string, exposure: Exposure = "direct", active = exposure === "direct", execute?: Execute): void {
+		this.tools.set(name, { name, exposure, sourceInfo: sourceInfo(path), definition: { name, execute } });
 		if (active) this.active.add(name);
 	}
 
@@ -90,21 +137,128 @@ export class FakePiHost {
 		await this.emit("session_shutdown", { reason });
 	}
 
+	/** Add a user message to the session entries (Pi records one per user prompt). */
+	addUserMessage(text: string): void {
+		this.entries.push({ type: "message", id: `m${this.entries.length + 1}`, message: { role: "user", content: text } });
+	}
+
 	/**
 	 * Call a tool as Pi does. Without `parentToolCallId` it is a model call (active tools
-	 * only); with it, a nested ctx.executeTool call. Returns the block reason or the result.
+	 * only); with it, a nested ctx.executeTool call. Throws only when the tool is not
+	 * callable on that path (a test error: the model cannot issue such a call). Returns the
+	 * block reason, or the result with `isError` (also for a thrown error or an abort).
 	 */
-	async callTool(name: string, args: unknown = {}, options: { parentToolCallId?: string } = {}): Promise<{ blocked?: string; result?: any }> {
-		const tool = this.tools.get(name);
-		const reachable = options.parentToolCallId
-			? tool && ((tool.exposure === "direct" && this.active.has(name)) || tool.exposure === "codemode" || tool.exposure === "deferred")
-			: tool && this.active.has(name) && tool.exposure !== "hidden";
-		if (!tool || !reachable) throw new Error(`FakePiHost: tool ${name} is not ${options.parentToolCallId ? "callable" : "active"}`);
-		const toolCallId = options.parentToolCallId ? `${options.parentToolCallId}/1` : "call-1";
-		for (const result of await this.emit("tool_call", { toolName: name, toolCallId, parentToolCallId: options.parentToolCallId, input: args })) {
-			if ((result as any)?.block) return { blocked: String((result as any).reason ?? "blocked") };
+	async callTool(name: string, args: unknown = {}, options: CallOptions = {}): Promise<{ blocked?: string; result?: any; isError: boolean; toolCallId: string }> {
+		if (!this.isCallable(name, options.parentToolCallId !== undefined)) {
+			throw new Error(`FakePiHost: tool ${name} is not ${options.parentToolCallId ? "callable" : "active"}`);
 		}
-		return { result: await tool.definition.execute(toolCallId, args, undefined, undefined, this.context()) };
+		const outcome = await this.runToolCall(name, args, options);
+		const { blocked, isError, toolCall } = outcome;
+		return blocked === undefined ? { result: outcome.result, isError, toolCallId: toolCall.id } : { blocked, isError, toolCallId: toolCall.id };
+	}
+
+	/** Tool context for execute(): the extension context plus `tools` and `executeTool`. */
+	toolContext(callerId: string, callerSignal?: AbortSignal): any {
+		const host = this;
+		return {
+			...this.context(),
+			get tools() {
+				return [...host.tools.values()].filter((tool) => host.isCallable(tool.name, true)).map((tool) => tool.definition);
+			},
+			executeTool: (name: string, args: unknown, options: { signal?: AbortSignal; onUpdate?: (partial: any) => void } = {}) =>
+				host.runToolCall(name, args, { parentToolCallId: callerId, signal: options.signal ?? callerSignal, onUpdate: options.onUpdate }),
+		};
+	}
+
+	private isCallable(name: string, nested: boolean): boolean {
+		const tool = this.tools.get(name);
+		if (!tool) return false;
+		if (nested) return (tool.exposure === "direct" && this.active.has(name)) || tool.exposure === "codemode" || tool.exposure === "deferred";
+		return this.active.has(name) && tool.exposure !== "hidden";
+	}
+
+	private nextId(parentToolCallId: string | undefined): string {
+		if (parentToolCallId === undefined) return `call-${++this.modelCalls}`;
+		const n = (this.nestedCounts.get(parentToolCallId) ?? 0) + 1;
+		this.nestedCounts.set(parentToolCallId, n);
+		return `${parentToolCallId}/${n}`;
+	}
+
+	private async emitTool(event: string, payload: Record<string, unknown>): Promise<unknown[]> {
+		this.toolEvents.push({ type: event, ...payload });
+		return this.emit(event, payload);
+	}
+
+	/** One call through the Pi 1.4.0 tool pipeline. Never rejects for tool failures. */
+	private async runToolCall(name: string, args: unknown, options: CallOptions): Promise<FakeToolOutcome> {
+		const { parentToolCallId, signal } = options;
+		const id = this.nextId(parentToolCallId);
+		const parent = parentToolCallId === undefined ? {} : { parentToolCallId };
+		const input = (args ?? {}) as Record<string, unknown>;
+		const toolCall = { id, name, arguments: input };
+		await this.emitTool("tool_execution_start", { toolCallId: id, toolName: name, args: input, ...parent });
+		const finish = async (result: any, isError: boolean, blocked?: string): Promise<FakeToolOutcome> => {
+			await this.emitTool("tool_execution_end", { toolCallId: id, toolName: name, result, isError, ...parent });
+			return blocked === undefined ? { toolCall, result, isError } : { toolCall, result, isError, blocked };
+		};
+		const tool = this.tools.get(name);
+		if (!tool || !this.isCallable(name, parentToolCallId !== undefined)) return finish(errorResult(`Tool ${name} not found`), true);
+		// tool_call handlers share one event (they may mutate `input`); the first block stops the rest.
+		const callEvent = { type: "tool_call", toolName: name, toolCallId: id, ...parent, input };
+		this.toolEvents.push(callEvent);
+		try {
+			for (const { handler } of this.handlers.get("tool_call") ?? []) {
+				const handled: any = await handler(callEvent, this.context());
+				if (handled?.block) {
+					const reason = String(handled.reason || "Tool execution was blocked");
+					return finish(errorResult(reason), true, reason);
+				}
+			}
+		} catch (error) {
+			return finish(errorResult(messageOf(error)), true);
+		}
+		if (signal?.aborted) return finish(errorResult("Operation aborted"), true);
+		let result: any;
+		let isError: boolean;
+		const updates: Promise<unknown>[] = [];
+		try {
+			const onUpdate = (partialResult: any) => {
+				options.onUpdate?.(partialResult);
+				updates.push(this.emitTool("tool_execution_update", { toolCallId: id, toolName: name, args: input, partialResult, ...parent }));
+			};
+			result = await tool.definition.execute(id, input, signal, onUpdate, this.toolContext(id, signal));
+			isError = result?.isError === true;
+		} catch (error) {
+			result = errorResult(messageOf(error));
+			isError = true;
+		}
+		await Promise.all(updates);
+		// tool_result handlers run in order; each sees the previous handler's changes.
+		const event: Record<string, any> = { toolName: name, toolCallId: id, ...parent, input, content: result?.content, details: result?.details, isError };
+		if (result?.structuredContent !== undefined) event.structuredContent = result.structuredContent;
+		this.toolEvents.push({ type: "tool_result", ...event });
+		let modified = false;
+		for (const { handler } of this.handlers.get("tool_result") ?? []) {
+			try {
+				const change: any = await handler({ type: "tool_result", ...event }, this.context());
+				if (!change) continue;
+				for (const key of ["content", "details", "structuredContent", "isError"]) {
+					if (change[key] === undefined) continue;
+					event[key] = change[key];
+					modified = true;
+				}
+				if (change.content !== undefined && change.structuredContent === undefined) delete event.structuredContent;
+			} catch {
+				// Pi reports a failing tool_result handler and keeps the result (runner.emitToolResult).
+			}
+		}
+		if (modified) {
+			result = { ...result, content: event.content ?? [], details: event.details ?? result?.details };
+			if (event.structuredContent === undefined) delete result.structuredContent;
+			else result.structuredContent = event.structuredContent;
+			isError = event.isError;
+		}
+		return finish(result, isError);
 	}
 
 	async runCommand(name: string, args = "", ctx: { hasUI?: boolean } = {}): Promise<void> {
@@ -124,6 +278,7 @@ export class FakePiHost {
 			mode: "rpc",
 			cwd: "/tmp",
 			ui: { notify: (message: string, level?: string) => this.notifications.push({ message, level }) },
+			sessionManager: { getEntries: () => [...this.entries] },
 			...extra,
 		};
 	}
@@ -170,9 +325,21 @@ export class FakePiHost {
 			sendMessage(message: SentMessage) {
 				host.messages.push(message);
 			},
+			appendEntry(customType: string, data?: unknown) {
+				host.entries.push({ type: "custom", id: `e${host.entries.length + 1}`, customType, data, timestamp: new Date().toISOString() });
+			},
 		};
 		return api as unknown as ExtensionAPI;
 	}
+}
+
+/** Pi's createErrorToolResult (agent-loop.js). */
+function errorResult(text: string) {
+	return { content: [{ type: "text", text }], details: {} };
+}
+
+function messageOf(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 function sourceInfo(path: string) {
