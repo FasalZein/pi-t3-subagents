@@ -210,7 +210,11 @@ describe("disabled native tools cannot run on any call path", () => {
 		const host = await boot({ ...T3_ENV });
 		await host.startSession();
 		// Not blocked: the T3 tool runs and refuses the launch itself (no T3 settings here).
-		await expect(host.callTool("subagent", {}, { parentToolCallId: "codemode-1" })).rejects.toThrow("subagent launch refused");
+		// Pi turns the thrown refusal into an error result; a nested call never rejects.
+		const nested = await host.callTool("subagent", {}, { parentToolCallId: "codemode-1" });
+		expect(nested.blocked).toBeUndefined();
+		expect(nested.isError).toBe(true);
+		expect(nested.result.content[0].text).toContain("subagent launch refused");
 	});
 
 	test("outside T3 nothing is blocked", async () => {
