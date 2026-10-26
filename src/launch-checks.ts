@@ -40,9 +40,11 @@ export function extensionApiCheck(pi: ExtensionAPI, child: ChildRuntime | undefi
 			if (seen.promptSections === false)
 				return { status: "fail", detail: "before_agent_start has no systemPromptOptions: the frontmatter cannot be removed from the prompt" };
 			const state = child.state();
+			// U5 observation: which T3 bridge tools are active in this child.
+			const bridge = pi.getActiveTools().filter((name) => name.startsWith("mcp__t3-code__"));
 			return {
 				status: "pass",
-				detail: `API methods present; prompt sections ${seen.promptSections === undefined ? "not observed yet" : "seen"}; header ${state?.source ?? "not read yet"}`,
+				detail: `API methods present; prompt sections ${seen.promptSections === undefined ? "not observed yet" : "seen"}; header ${state?.source ?? "not read yet"}, budget ${state?.budget ?? "unknown"}; active bridge tools (${bridge.length}): ${bridge.join(", ") || "none"}`,
 			};
 		},
 	};
