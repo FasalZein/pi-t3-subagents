@@ -19,7 +19,7 @@ let failures = 0;
 
 function probe(binary: string, args: string[]): Promise<{ ok: boolean; detail: string }> {
 	return new Promise((done) => {
-		const env = { ...process.env, T3_MCP_URL: "http://127.0.0.1:9/mcp", T3_MCP_BEARER_TOKEN: "fake-probe-token" };
+		const env: NodeJS.ProcessEnv = { ...process.env, T3_MCP_URL: "http://127.0.0.1:9/mcp", T3_MCP_BEARER_TOKEN: "fake-probe-token" };
 		delete env.PI_DENY_TOOLS;
 		const child = spawn(binary, ["--mode", "rpc", "--no-session", ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
 		let out = "";

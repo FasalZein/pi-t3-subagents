@@ -3,9 +3,12 @@ import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { c6SettingsShape, c7LaunchArgs } from "../src/doctor-checks.ts";
-import { runSync } from "../src/sync.ts";
-import { acquireLock, writeSettings } from "../src/settings-writer.ts";
+import { createExtension } from "../../index.ts";
+import { c6SettingsShape, c7LaunchArgs } from "../../src/doctor-checks.ts";
+import { runSync } from "../../src/sync.ts";
+import { acquireLock, writeSettings } from "../../src/settings-writer.ts";
+import { resetCopyRegistry } from "../../src/takeover.ts";
+import { FakePiHost } from "../harness/fake-pi.ts";
 import { noUi, type TempHost, tempHost, yesUi } from "./sync-helpers.ts";
 
 const BIN = "/opt/test/bin/pi";
@@ -15,6 +18,7 @@ const SPAWNER_TOOLS = "subagent,mcp__t3-code__delegate_task,mcp__t3-code__task_s
 
 let hosts: TempHost[] = [];
 afterEach(() => {
+	resetCopyRegistry();
 	for (const h of hosts) h.cleanup();
 	hosts = [];
 });
@@ -265,7 +269,7 @@ describe("ownership and namespaces", () => {
 describe("repository fixture agents", () => {
 	test("the live-test fixtures plan without a skip in a namespace and keep their dummy secret out", async () => {
 		const h = host("t3e2e-s2-");
-		const fixtures = join(import.meta.dir, "fixtures", "agents");
+		const fixtures = join(import.meta.dir, "..", "fixtures", "agents");
 		const env = { ...h.env, PI_T3_AGENTS_DIR: fixtures };
 		h.writeSettings({ providerInstances: { "t3e2e-s2-main": mainEntry(h) } });
 		const report = await runSync({ args: "--yes", env, extensionPath: h.extensionPath, ui: noUi, reloadWaitMs: 0 });
@@ -401,5 +405,34 @@ describe("settings writer interleavings", () => {
 		expect(c7.status).toBe("fail");
 		expect(c7.detail).toContain("reserved flag --session");
 		expect(c7.detail).toContain("short flag -p");
+	});
+});
+
+describe("entry wiring (S1 seams)", () => {
+	test("outside T3 /t3-sync-agents is registered; without UI and --yes it writes nothing", async () => {
+		const h = host();
+		h.agent("leaf", "model: x/y");
+		const original = h.writeSettings({ providerInstances: { pi: mainEntry(h) } });
+		const pi = new FakePiHost();
+		await pi.load("/ext/index.ts", createExtension({ ...h.env }, "/ext/index.ts"));
+		await pi.startSession();
+		expect(pi.tools.size).toBe(0);
+		await pi.runCommand("t3-sync-agents");
+		expect(pi.notifications.at(-1)?.message).toContain("run /t3-sync-agents --yes");
+		expect(pi.notifications.at(-1)?.message).toContain("add: pi-leaf");
+		expect(h.settingsText()).toBe(original);
+	});
+
+	test("inside T3 the doctor reports C6 and C7", async () => {
+		const h = host();
+		h.writeSettings({ providerInstances: { pi: mainEntry(h) } });
+		const pi = new FakePiHost();
+		const env = { ...h.env, T3_MCP_URL: "http://127.0.0.1:1/mcp", T3_MCP_BEARER_TOKEN: "fake-token" };
+		await pi.load("/ext/index.ts", createExtension(env, "/ext/index.ts"));
+		await pi.startSession();
+		await pi.runCommand("t3-subagents-doctor");
+		const text = String(pi.messages.at(-1)?.content);
+		expect(text).toMatch(/^C6 PASS /m);
+		expect(text).toMatch(/^C7 PASS .*no managed instances in namespace pi-/m);
 	});
 });
