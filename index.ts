@@ -1,15 +1,21 @@
 /**
  * pi-t3-subagents: inside T3 Code, run pi-subagents agents as T3 child threads.
- * Spec: docs/specs/t3-subagents.md. Decisions: docs/adr/.
+ * User guide: README.md. Spec: docs/specs/t3-subagents.md. Decisions: docs/adr/.
  *
  * This file only wires modules together; each module owns its behavior:
- * - src/takeover.ts: replaces pi-subagents' `subagent` in T3 and fails soft (ADR 0001).
- * - src/doctor.ts: `/t3-subagents-doctor` and the compatibility checks (D31).
- * - src/subagent-tool.ts + src/launch-planner.ts: the T3 `subagent` tool (S3).
+ * - src/takeover.ts: replaces pi-subagents' `subagent` in T3 and fails soft (ADR 0001); C1, C2.
+ * - src/doctor.ts: `/t3-subagents-doctor` and the compatibility checks C1 to C10 (D31); C3.
+ * - src/subagent-tool.ts + src/launch-planner.ts: the T3 `subagent` tool: validation, batches,
+ *   synchronous waits, result states (S3, S4); src/launch-checks.ts: C4 and C8.
+ * - src/ledger.ts: live-children ledger for spawn-width (S4, D11, D21, D34); C5.
+ * - src/raw-delegation-guard.ts + src/child-tools.ts: raw-delegation guard and child tool exposure (S5, D22); C8.
  * - src/roster.ts: the agent roster for the parent model (D30).
  * - src/child-runtime.ts: env, prompt strip, header and revision check in a child (S3).
- * - src/sync-command.ts: `/t3-sync-agents` (S2); src/doctor-checks.ts: C6 and C7; src/launch-checks.ts: C4 and C8.
+ * - src/caller-ping.ts: `caller_ping` in managed children (S6, ADR 0003).
+ * - src/run-limits.ts: context warnings and the time limit in managed children (S7).
+ * - src/sync-command.ts + src/sync.ts: `/t3-sync-agents` (S2, ADR 0005); src/doctor-checks.ts: C6, C7, C9, C10.
  * - src/managed-child-tools.ts: managed-child tools install only in the copy that owns the takeover.
+ * - Interactive agents (S8) need no wiring: the hint is chosen in src/launch-planner.ts.
  *
  * Slice slots (spec "Delivery Slices", ownership table): S4-S8 each add their wiring only
  * inside their own marked slot below, and their imports at the end of the import list.
